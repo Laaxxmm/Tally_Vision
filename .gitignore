@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# SQLite database (contains company financial data)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Debug / scratch files from development
+_*.js
+_*.txt
+_*.html
+_*.json
+check*.js
+debug.js
+query-db*.js
+test-db.js
+db-*.txt
+dash-raw.txt
+
+# npm logs
+npm-*.log
+npm-*.txt
+npm_*.txt
+npm_*.log
+*.log
+
+# Claude local settings
+.claude/settings.local.json
+
+# Backup files from editor
+*.bak
+*.bak2
+
+# OS
+.DS_Store
+Thumbs.db

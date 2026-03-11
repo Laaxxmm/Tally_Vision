@@ -1,0 +1,19 @@
+{
+  "name": "tallyvision",
+  "version": "1.0.0",
+  "description": "TallyVision - MIS Dashboard for Tally Prime & ERP 9",
+  "main": "src/backend/server.js",
+  "scripts": {
+    "start": "node src/backend/server.js",
+    "extract": "node src/backend/run-extraction.js",
+    "setup-db": "node -e \"require('./src/backend/db/setup.js').initDatabase(); console.log('DB ready');\""
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "fast-xml-parser": "^5.3.5",
+    "node-cron": "^3.0.3",
+    "uuid": "^10.0.0"
+  }
+}

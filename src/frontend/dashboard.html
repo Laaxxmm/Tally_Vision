@@ -1,0 +1,549 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TallyVision - MIS Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+        }
+
+        .glass {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(100, 116, 139, 0.2);
+        }
+
+        .kpi-card {
+            transition: transform 0.2s;
+        }
+
+        .kpi-card:hover {
+            transform: translateY(-2px);
+        }
+
+        .positive {
+            color: #4ade80;
+        }
+
+        .negative {
+            color: #f87171;
+        }
+
+        .chart-container {
+            position: relative;
+            height: 300px;
+        }
+
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        .sync-bar {
+            transition: width 0.5s ease;
+        }
+    </style>
+</head>
+
+<body class="min-h-screen">
+    <div id="app" class="max-w-[1600px] mx-auto p-4">
+
+        <!-- Header -->
+        <header class="flex items-center justify-between mb-6">
+            <div class="flex items-center gap-3">
+                <div
+                    class="w-10 h-10 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center font-bold text-lg">
+                    TV</div>
+                <div>
+                    <h1 class="text-xl font-bold text-white">TallyVision</h1>
+                    <p class="text-xs text-slate-400" id="companyName">MIS Dashboard</p>
+                </div>
+                <select id="companySelect" onchange="switchCompany(this.value)"
+                    class="bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-sm text-white ml-4 max-w-[300px]">
+                    <option>Loading...</option>
+                </select>
+            </div>
+            <div class="flex items-center gap-4">
+                <div id="tallyStatus" class="flex items-center gap-2 text-sm">
+                    <span class="w-2 h-2 rounded-full bg-red-500"></span>
+                    <span class="text-slate-400">Checking Tally...</span>
+                </div>
+                <div class="flex gap-2">
+                    <input type="date" id="fromDate"
+                        class="bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-sm text-white"
+                        value="2024-04-01">
+                    <input type="date" id="toDate"
+                        class="bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-sm text-white"
+                        value="2025-03-31">
+                    <button onclick="loadDashboard()"
+                        class="bg-blue-600 hover:bg-blue-700 px-4 py-1.5 rounded text-sm font-medium transition">Apply</button>
+                </div>
+                <button onclick="showSetup()"
+                    class="bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded text-sm transition">&#9881;
+                    Settings</button>
+            </div>
+        </header>
+
+        <!-- Sync Progress Bar -->
+        <div id="syncBar" class="hidden mb-4 glass rounded-lg p-3">
+            <div class="flex items-center justify-between mb-2">
+                <span class="text-sm font-medium" id="syncMessage">Syncing...</span>
+                <span class="text-xs text-slate-400" id="syncPercent">0%</span>
+            </div>
+            <div class="w-full bg-slate-700 rounded-full h-2">
+                <div id="syncProgress" class="bg-blue-500 h-2 rounded-full sync-bar" style="width: 0%"></div>
+            </div>
+        </div>
+
+        <!-- KPI Cards Row -->
+        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3 mb-6" id="kpiGrid">
+            <!-- Filled dynamically -->
+        </div>
+
+        <!-- Charts Row 1: Revenue vs Expense + Profit Trend -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+            <div class="glass rounded-xl p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-3">&#128202; Revenue vs Expenses (Monthly)</h3>
+                <div class="chart-container"><canvas id="chartRevExp"></canvas></div>
+            </div>
+            <div class="glass rounded-xl p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-3">&#128200; Net Profit Trend</h3>
+                <div class="chart-container"><canvas id="chartProfit"></canvas></div>
+            </div>
+        </div>
+
+        <!-- Charts Row 2: Top Expenses + Top Revenue -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+            <div class="glass rounded-xl p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-3">&#128308; Top 10 Expenses</h3>
+                <div class="chart-container"><canvas id="chartTopExp"></canvas></div>
+            </div>
+            <div class="glass rounded-xl p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-3">&#128994; Top 10 Revenue Sources</h3>
+                <div class="chart-container"><canvas id="chartTopRev"></canvas></div>
+            </div>
+        </div>
+
+        <!-- Charts Row 3: Expense Pie + Revenue Pie -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+            <div class="glass rounded-xl p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-3">&#129383; Expense Categories</h3>
+                <div class="chart-container"><canvas id="chartExpPie"></canvas></div>
+            </div>
+            <div class="glass rounded-xl p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-3">&#129383; Revenue Categories</h3>
+                <div class="chart-container"><canvas id="chartRevPie"></canvas></div>
+            </div>
+        </div>
+
+        <!-- Charts Row 4: Receivable Ageing + Payable Ageing -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+            <div class="glass rounded-xl p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-3">&#128203; Receivable Ageing (Top Debtors)</h3>
+                <div class="chart-container"><canvas id="chartRecAgeing"></canvas></div>
+            </div>
+            <div class="glass rounded-xl p-5">
+                <h3 class="text-sm font-semibold text-slate-300 mb-3">&#128203; Payable Ageing (Top Creditors)</h3>
+                <div class="chart-container"><canvas id="chartPayAgeing"></canvas></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Setup Modal -->
+    <div id="setupModal" class="fixed inset-0 bg-black/50 hidden z-50 flex items-center justify-center">
+        <div class="glass rounded-2xl p-8 w-[500px] max-h-[80vh] overflow-y-auto">
+            <h2 class="text-lg font-bold mb-4">&#9881; TallyVision Setup</h2>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm text-slate-400 mb-1">Tally Host</label>
+                    <input id="settHost" type="text" value="localhost"
+                        class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white">
+                </div>
+                <div>
+                    <label class="block text-sm text-slate-400 mb-1">Tally Port</label>
+                    <input id="settPort" type="number" value="9000"
+                        class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white">
+                </div>
+                <div>
+                    <label class="block text-sm text-slate-400 mb-1">Company Name (from Tally)</label>
+                    <select id="settCompany"
+                        class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white">
+                        <option>Loading...</option>
+                    </select>
+                    <button onclick="refreshCompanies()" class="text-xs text-blue-400 mt-1 hover:underline">&#8635;
+                        Refresh from Tally</button>
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1">Sync From</label>
+                        <input id="settFrom" type="date" value="2024-04-01"
+                            class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white">
+                    </div>
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1">Sync To</label>
+                        <input id="settTo" type="date" value="2025-03-31"
+                            class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white">
+                    </div>
+                </div>
+                <button onclick="startSync()"
+                    class="w-full bg-blue-600 hover:bg-blue-700 py-2.5 rounded-lg font-medium transition">
+                    &#128260; Start Full Sync
+                </button>
+                <div class="flex justify-end gap-2 mt-4">
+                    <button onclick="saveSettings()"
+                        class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded text-sm transition">&#128190; Save
+                        Settings</button>
+                    <button onclick="closeSetup()"
+                        class="bg-slate-600 hover:bg-slate-700 px-4 py-2 rounded text-sm transition">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API = 'http://localhost:3456/api';
+        let charts = {};
+        let currentCompanyId = null;
+
+        // ===== FORMATTING =====
+        function fmt(num) {
+            if (num === undefined || num === null) return '\u20B90';
+            const abs = Math.abs(num);
+            if (abs >= 10000000) return '\u20B9' + (num / 10000000).toFixed(2) + ' Cr';
+            if (abs >= 100000) return '\u20B9' + (num / 100000).toFixed(2) + ' L';
+            if (abs >= 1000) return '\u20B9' + (num / 1000).toFixed(1) + ' K';
+            return '\u20B9' + num.toFixed(0);
+        }
+
+        function monthLabel(dateStr) {
+            if (!dateStr) return '';
+            const d = new Date(dateStr);
+            return d.toLocaleString('en-IN', { month: 'short', year: '2-digit' });
+        }
+
+        // ===== KPI CARDS =====
+        function renderKPIs(data) {
+            const kpis = [
+                { label: 'Revenue (Sales)', value: fmt(data.revenue), color: 'from-green-500 to-emerald-600', icon: '&#128176;' },
+                { label: 'Purchase', value: fmt(data.purchase), color: 'from-orange-500 to-amber-600', icon: '&#128230;' },
+                { label: 'Direct Expenses', value: fmt(data.directExpenses), color: 'from-red-500 to-rose-600', icon: '&#128295;' },
+                { label: 'Indirect Expenses', value: fmt(data.indirectExpenses), color: 'from-pink-500 to-red-600', icon: '&#128196;' },
+                { label: 'Gross Profit', value: fmt(data.grossProfit), color: data.grossProfit >= 0 ? 'from-blue-500 to-cyan-600' : 'from-red-500 to-pink-600', icon: '&#128202;' },
+                { label: 'Net Profit', value: fmt(data.netProfit), color: data.netProfit >= 0 ? 'from-green-500 to-teal-600' : 'from-red-500 to-pink-600', icon: data.netProfit >= 0 ? '&#128200;' : '&#128201;' },
+                { label: 'Receivables', value: fmt(data.receivables), color: 'from-amber-500 to-yellow-600', icon: '&#128229;' },
+                { label: 'Payables', value: fmt(data.payables), color: 'from-purple-500 to-violet-600', icon: '&#128228;' },
+                { label: 'Cash & Bank', value: fmt(data.cashBankBalance), color: 'from-sky-500 to-blue-600', icon: '&#127974;' },
+                { label: 'Loans', value: fmt(data.loans), color: 'from-rose-500 to-red-600', icon: '&#127970;' },
+            ];
+
+            document.getElementById('kpiGrid').innerHTML = kpis.map(k => `
+                <div class="kpi-card glass rounded-xl p-4">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-xs text-slate-400">${k.label}</span>
+                        <span class="text-lg">${k.icon}</span>
+                    </div>
+                    <div class="text-lg font-bold text-white">${k.value}</div>
+                    ${k.sub ? `<div class="text-xs text-slate-400 mt-1">${k.sub}</div>` : ''}
+                </div>
+            `).join('');
+        }
+
+        // ===== CHART HELPERS =====
+        const chartColors = {
+            blue: 'rgba(59, 130, 246, 0.8)',
+            green: 'rgba(34, 197, 94, 0.8)',
+            red: 'rgba(239, 68, 68, 0.8)',
+            amber: 'rgba(245, 158, 11, 0.8)',
+            purple: 'rgba(168, 85, 247, 0.8)',
+            cyan: 'rgba(6, 182, 212, 0.8)',
+            pink: 'rgba(236, 72, 153, 0.8)',
+            palette: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#14b8a6', '#f97316', '#6366f1']
+        };
+
+        const defaultChartOpts = {
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { labels: { color: '#94a3b8', font: { size: 11 } } } },
+            scales: {
+                x: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: 'rgba(51,65,85,0.5)' } },
+                y: { ticks: { color: '#64748b', font: { size: 10 }, callback: v => fmt(v) }, grid: { color: 'rgba(51,65,85,0.3)' } }
+            }
+        };
+
+        // Horizontal bar chart options
+        const horizBarOpts = {
+            responsive: true, maintainAspectRatio: false,
+            indexAxis: 'y',
+            plugins: { legend: { labels: { color: '#94a3b8', font: { size: 11 } } } },
+            scales: {
+                x: { ticks: { color: '#64748b', font: { size: 10 }, callback: v => fmt(v) }, grid: { color: 'rgba(51,65,85,0.3)' } },
+                y: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: 'rgba(51,65,85,0.5)' } }
+            }
+        };
+
+        function destroyChart(id) { if (charts[id]) { charts[id].destroy(); delete charts[id]; } }
+
+        // ===== RENDER CHARTS =====
+        function renderMonthlyTrend(data) {
+            destroyChart('revExp');
+            charts['revExp'] = new Chart(document.getElementById('chartRevExp'), {
+                type: 'bar',
+                data: {
+                    labels: data.map(d => monthLabel(d.month)),
+                    datasets: [
+                        { label: 'Revenue', data: data.map(d => d.revenue), backgroundColor: chartColors.green, borderRadius: 4 },
+                        { label: 'Expenses', data: data.map(d => d.expenses), backgroundColor: chartColors.red, borderRadius: 4 }
+                    ]
+                },
+                options: { ...defaultChartOpts }
+            });
+
+            destroyChart('profit');
+            charts['profit'] = new Chart(document.getElementById('chartProfit'), {
+                type: 'line',
+                data: {
+                    labels: data.map(d => monthLabel(d.month)),
+                    datasets: [{
+                        label: 'Net Profit', data: data.map(d => d.profit),
+                        borderColor: chartColors.blue, backgroundColor: 'rgba(59,130,246,0.1)',
+                        fill: true, tension: 0.4, pointRadius: 4
+                    }]
+                },
+                options: defaultChartOpts
+            });
+        }
+
+        function renderTopExpenses(data) {
+            destroyChart('topExp');
+            charts['topExp'] = new Chart(document.getElementById('chartTopExp'), {
+                type: 'bar',
+                data: {
+                    labels: data.map(d => d.ledger_name?.substring(0, 25)),
+                    datasets: [{ label: 'Amount', data: data.map(d => d.total), backgroundColor: chartColors.red, borderRadius: 4 }]
+                },
+                options: horizBarOpts
+            });
+        }
+
+        function renderTopRevenue(data) {
+            destroyChart('topRev');
+            charts['topRev'] = new Chart(document.getElementById('chartTopRev'), {
+                type: 'bar',
+                data: {
+                    labels: data.map(d => d.ledger_name?.substring(0, 25)),
+                    datasets: [{ label: 'Amount', data: data.map(d => d.total), backgroundColor: chartColors.green, borderRadius: 4 }]
+                },
+                options: horizBarOpts
+            });
+        }
+
+        function renderPieChart(canvasId, chartKey, data, title) {
+            destroyChart(chartKey);
+            charts[chartKey] = new Chart(document.getElementById(canvasId), {
+                type: 'doughnut',
+                data: {
+                    labels: data.map(d => d.category?.substring(0, 30)),
+                    datasets: [{ data: data.map(d => d.total), backgroundColor: chartColors.palette }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { legend: { position: 'right', labels: { color: '#94a3b8', font: { size: 10 }, padding: 8 } } }
+                }
+            });
+        }
+
+        function renderAgeing(canvasId, chartKey, data) {
+            destroyChart(chartKey);
+            charts[chartKey] = new Chart(document.getElementById(canvasId), {
+                type: 'bar',
+                data: {
+                    labels: data.map(d => d.party_name?.substring(0, 20)),
+                    datasets: [
+                        { label: '0-30 days', data: data.map(d => d['0_30']), backgroundColor: '#22c55e' },
+                        { label: '31-60 days', data: data.map(d => d['31_60']), backgroundColor: '#f59e0b' },
+                        { label: '61-90 days', data: data.map(d => d['61_90']), backgroundColor: '#f97316' },
+                        { label: '90+ days', data: data.map(d => d['90_plus']), backgroundColor: '#ef4444' },
+                    ]
+                },
+                options: { ...defaultChartOpts, scales: { ...defaultChartOpts.scales, x: { ...defaultChartOpts.scales.x, stacked: true }, y: { ...defaultChartOpts.scales.y, stacked: true } } }
+            });
+        }
+
+        // ===== DATA LOADING =====
+        async function api(path) {
+            try {
+                const res = await fetch(API + path);
+                return await res.json();
+            } catch { return null; }
+        }
+
+        function switchCompany(companyId) {
+            currentCompanyId = companyId;
+            const sel = document.getElementById('companySelect');
+            const name = sel.options[sel.selectedIndex]?.textContent || '';
+            document.getElementById('companyName').textContent = name;
+            loadDashboard();
+        }
+
+        async function loadDashboard() {
+            if (!currentCompanyId) return console.log('No company selected');
+            const btn = document.querySelector('button[onclick="loadDashboard()"]');
+            if (btn) { btn.textContent = 'Loading...'; btn.disabled = true; }
+            const from = document.getElementById('fromDate').value;
+            const to = document.getElementById('toDate').value;
+            const q = `companyId=${currentCompanyId}&fromDate=${from}&toDate=${to}`;
+
+            const [kpi, trend, topExp, topRev, expCat, revCat, recAge, payAge] = await Promise.all([
+                api(`/dashboard/kpi?${q}`),
+                api(`/dashboard/monthly-trend?${q}`),
+                api(`/dashboard/top-expenses?${q}`),
+                api(`/dashboard/top-revenue?${q}`),
+                api(`/dashboard/expense-categories?${q}`),
+                api(`/dashboard/revenue-categories?${q}`),
+                api(`/dashboard/receivable-ageing?companyId=${currentCompanyId}`),
+                api(`/dashboard/payable-ageing?companyId=${currentCompanyId}`)
+            ]);
+
+            if (kpi) renderKPIs(kpi);
+            if (trend?.length) renderMonthlyTrend(trend);
+            if (topExp?.length) renderTopExpenses(topExp);
+            if (topRev?.length) renderTopRevenue(topRev);
+            if (expCat?.length) renderPieChart('chartExpPie', 'expPie', expCat, 'Expense Categories');
+            if (revCat?.length) renderPieChart('chartRevPie', 'revPie', revCat, 'Revenue Categories');
+            if (recAge?.length) renderAgeing('chartRecAgeing', 'recAge', recAge);
+            if (payAge?.length) renderAgeing('chartPayAgeing', 'payAge', payAge);
+            if (btn) { btn.textContent = 'Apply'; btn.disabled = false; }
+        }
+
+        // ===== TALLY STATUS (indicator only — never blocks dashboard) =====
+        async function checkStatus() {
+            const status = await api('/status');
+            const el = document.getElementById('tallyStatus');
+            if (status?.tally?.reachable) {
+                el.innerHTML = '<span class="w-2 h-2 rounded-full bg-green-500"></span><span class="text-green-400">Tally Connected</span>';
+            } else {
+                el.innerHTML = '<span class="w-2 h-2 rounded-full bg-red-500 pulse"></span><span class="text-red-400">Tally Offline</span>';
+            }
+        }
+
+        // ===== COMPANY LIST (from local DB — instant, no Tally dependency) =====
+        async function loadCompanies() {
+            const companies = await api('/companies');
+            if (!companies?.length) return;
+            const sel = document.getElementById('companySelect');
+            const prevId = currentCompanyId;
+            sel.innerHTML = '';
+            companies.forEach(c => {
+                const opt = document.createElement('option');
+                opt.value = c.id; opt.textContent = c.name;
+                sel.appendChild(opt);
+            });
+            if (prevId && [...sel.options].some(o => o.value == prevId)) {
+                sel.value = prevId;
+            } else {
+                currentCompanyId = companies[0].id;
+                sel.value = companies[0].id;
+            }
+            const name = sel.options[sel.selectedIndex]?.textContent || '';
+            document.getElementById('companyName').textContent = name;
+        }
+
+        // ===== SYNC =====
+        async function startSync() {
+            const company = document.getElementById('settCompany').value;
+            const from = document.getElementById('settFrom').value;
+            const to = document.getElementById('settTo').value;
+            if (!company || company === 'Loading...') return alert('Select a company first');
+
+            const syncRes = await fetch(API + '/sync/start', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ companyName: company, fromDate: from, toDate: to })
+            });
+            const syncData = await syncRes.json();
+            if (syncData.companyId) currentCompanyId = syncData.companyId;
+
+            closeSetup();
+            document.getElementById('syncBar').classList.remove('hidden');
+            pollSync();
+        }
+
+        async function pollSync() {
+            const res = await api('/sync/progress');
+            if (!res) return;
+            document.getElementById('syncMessage').textContent = res.progress?.message || 'Syncing...';
+            document.getElementById('syncPercent').textContent = (res.progress?.progress || 0) + '%';
+            document.getElementById('syncProgress').style.width = (res.progress?.progress || 0) + '%';
+
+            if (res.inProgress) {
+                setTimeout(pollSync, 1500);
+            } else {
+                document.getElementById('syncBar').classList.add('hidden');
+                await loadCompanies();
+                loadDashboard();
+                checkStatus();
+            }
+        }
+
+        async function refreshCompanies() {
+            const companies = await api('/tally/companies');
+            const sel = document.getElementById('settCompany');
+            sel.innerHTML = '';
+            if (companies?.companies?.length) {
+                companies.companies.forEach(c => {
+                    const opt = document.createElement('option');
+                    opt.value = c.name; opt.textContent = c.name;
+                    sel.appendChild(opt);
+                });
+            } else {
+                sel.innerHTML = '<option>No companies found (is Tally open?)</option>';
+            }
+        }
+
+        function showSetup() {
+            document.getElementById('setupModal').classList.remove('hidden');
+            refreshCompanies();
+        }
+        function closeSetup() { document.getElementById('setupModal').classList.add('hidden'); }
+
+        async function saveSettings() {
+            await fetch(API + '/settings', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    tally_host: document.getElementById('settHost').value,
+                    tally_port: document.getElementById('settPort').value
+                })
+            });
+            alert('Settings saved!');
+        }
+
+        // ===== INIT =====
+        window.addEventListener('load', async () => {
+            await loadCompanies();    // Fast DB query — no Tally, loads company dropdown
+            loadDashboard();          // Start rendering immediately
+            checkStatus();            // Fire-and-forget Tally ping — never blocks UI
+            setInterval(checkStatus, 30000);    // Re-check Tally every 30s
+            setInterval(loadCompanies, 60000);  // Refresh company list every 60s
+        });
+    </script>
+</body>
+
+</html>
