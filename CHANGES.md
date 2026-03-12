@@ -144,3 +144,63 @@ All fixes are documented here with root cause, file affected, and what changed.
 - Tally's Collection export only surfaces the currently-active Tally period's vouchers.
 - To sync a historical FY (e.g. 2024–25) when Tally's UI is set to 2025–26: the user must temporarily change Tally's period (F2 in Tally) to the historical FY, run sync, then switch back.
 
+---
+
+## Session 4 — 2026-03-11
+
+### [FEAT-1] YTD default dates on dashboard load
+**File:** `src/frontend/dashboard.html`
+**Change:** Replaced hardcoded `value="2024-04-01"` / `value="2025-03-31"` on date inputs with dynamic `getYTDDates()` function called on `window.load`. Computes FY start year as `current year if month ≥ April, else current year − 1`. `fromDate` = `fyStartYear-04-01`, `toDate` = today's date in `YYYY-MM-DD`.
+
+---
+
+### [FEAT-2] Loans card removed from KPI grid
+**File:** `src/frontend/dashboard.html` → `renderKPIs()`
+**Change:** Removed the Loans card entry from the `kpis` array. Dashboard now shows 9 KPI cards. Grid remains `lg:grid-cols-5` (2 rows: 5+4).
+
+---
+
+### [FEAT-3] Q1/Q2/Q3/Q4 shortcut buttons with contiguous multi-select
+**File:** `src/frontend/dashboard.html`
+**Change:** Added four quarter buttons (`Q1`–`Q4`) in the header next to the date inputs. Indian FY quarters: Q1=Apr–Jun, Q2=Jul–Sep, Q3=Oct–Dec, Q4=Jan–Mar. Logic:
+- Clicking an unselected Q sets it as the only selection.
+- Clicking an **adjacent** Q extends the contiguous range (Q1→Q2 = Apr–Sep; Q1→Q3 = Apr–Dec, etc.).
+- Clicking a non-adjacent Q resets to just that quarter.
+- Changing dates manually clears quarter highlight.
+- Quarter change calls `loadDashboard()` immediately (no Apply button needed).
+CSS `.q-btn.active` highlights selected buttons in blue.
+
+---
+
+### [FEAT-4] Single combined trend chart with dropdown
+**Files:** `src/frontend/dashboard.html`, `src/backend/server.js`
+**Change:** Replaced two separate chart containers (`chartRevExp` bar + `chartProfit` line) with one full-width `chartTrend` canvas and a `<select>` dropdown:
+- **"Revenue vs Expenses"** → dual-bar chart (green = Revenue, red = Expenses) — identical to old `chartRevExp`.
+- **"GP% vs NP% Ratio"** → dual-line chart with GP% (green) and NP% (blue) per month. Y-axis shows percentages.
+Trend data cached in `cachedTrend` — dropdown switch re-renders without a new API call.
+**Backend:** Enhanced `/api/dashboard/monthly-trend` to return `grossProfit` and `netProfit` per month (in addition to `revenue` and `expenses`). Separated the old combined `expSet` into individual sets for `purchaseSet`, `directExpSet`, `directIncSet`, `indirectExpSet`, `indirectIncSet`. GP/NP formula mirrors the KPI endpoint exactly.
+
+---
+
+### [FEAT-5] Card click drill-down analysis pages
+**Files:** `src/frontend/dashboard.html`, `src/backend/server.js`
+**Cards with analysis (7):**
+| Card | Analysis Type | Chart |
+|------|--------------|-------|
+| Revenue | Ledger breakdown via `/ledger-breakdown?groupRoot=Sales Accounts` | Doughnut pie |
+| Purchase | Ledger breakdown via `groupRoot=Purchase Accounts` | Doughnut pie |
+| Direct Expenses | Ledger breakdown via `groupRoot=Direct Expenses` | Doughnut pie |
+| Indirect Expenses | Ledger breakdown via `groupRoot=Indirect Expenses` | Doughnut pie |
+| Receivables | Top debtors from `/receivable-ageing` | Horizontal bar |
+| Payables | Top creditors from `/payable-ageing` | Horizontal bar |
+| Cash & Bank | Individual balances from `/ledger-breakdown?groupRoot=Cash-in-Hand,Bank Accounts&mode=balance` | Horizontal bar |
+
+**Cards without analysis:** Gross Profit, Net Profit (no onclick).
+
+**Overlay:** Full-screen `fixed inset-0 z-40 bg-slate-950` panel with "← Back to Dashboard" button, title, and chart. Hidden by default (`hidden` class), shown on card click.
+
+**New backend endpoint:** `GET /api/dashboard/ledger-breakdown?companyId&fromDate&toDate&groupRoot&mode`
+- `mode=balance`: reads `trial_balance` closing_balance for latest month ≤ toDate (for BS items like Cash/Bank).
+- `mode` omitted: sums `vouchers` by ledger for the date range (for P&L flow items).
+- `groupRoot` can be comma-separated for multiple root groups.
+

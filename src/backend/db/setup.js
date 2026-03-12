@@ -210,6 +210,93 @@ function createSchema(db) {
         CREATE INDEX IF NOT EXISTS idx_bills_company ON bills_outstanding(company_id, as_on_date, nature);
 
         -- ============================================
+        -- COST CENTRES (Optional Module)
+        -- ============================================
+        CREATE TABLE IF NOT EXISTS cost_centres (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            parent TEXT,
+            category TEXT,
+            UNIQUE(company_id, name)
+        );
+
+        -- ============================================
+        -- COST ALLOCATIONS (Optional Module)
+        -- ============================================
+        CREATE TABLE IF NOT EXISTS cost_allocations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+            date DATE NOT NULL,
+            voucher_type TEXT NOT NULL DEFAULT '',
+            voucher_number TEXT NOT NULL DEFAULT '',
+            ledger_name TEXT NOT NULL DEFAULT '',
+            cost_centre TEXT NOT NULL DEFAULT '',
+            amount REAL DEFAULT 0,
+            sync_month TEXT,
+            UNIQUE(company_id, date, voucher_type, voucher_number, ledger_name, cost_centre)
+        );
+        CREATE INDEX IF NOT EXISTS idx_costalloc_company ON cost_allocations(company_id, date);
+
+        -- ============================================
+        -- GST ENTRIES (Optional Module)
+        -- ============================================
+        CREATE TABLE IF NOT EXISTS gst_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+            date DATE NOT NULL,
+            voucher_type TEXT NOT NULL DEFAULT '',
+            voucher_number TEXT NOT NULL DEFAULT '',
+            party_name TEXT NOT NULL DEFAULT '',
+            gstin TEXT,
+            supply_type TEXT,
+            hsn_sac TEXT,
+            taxable_value REAL DEFAULT 0,
+            igst REAL DEFAULT 0,
+            cgst REAL DEFAULT 0,
+            sgst REAL DEFAULT 0,
+            cess REAL DEFAULT 0,
+            sync_month TEXT,
+            UNIQUE(company_id, date, voucher_number, party_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_gst_company ON gst_entries(company_id, date);
+
+        -- ============================================
+        -- PAYROLL ENTRIES (Optional Module)
+        -- ============================================
+        CREATE TABLE IF NOT EXISTS payroll_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+            date DATE NOT NULL,
+            voucher_number TEXT NOT NULL DEFAULT '',
+            employee_name TEXT NOT NULL DEFAULT '',
+            employee_group TEXT,
+            pay_head TEXT NOT NULL DEFAULT '',
+            amount REAL DEFAULT 0,
+            sync_month TEXT,
+            UNIQUE(company_id, date, voucher_number, employee_name, pay_head)
+        );
+        CREATE INDEX IF NOT EXISTS idx_payroll_company ON payroll_entries(company_id, date);
+
+        -- ============================================
+        -- STOCK ITEM LEDGER (Optional Module, on-demand)
+        -- ============================================
+        CREATE TABLE IF NOT EXISTS stock_item_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+            date DATE NOT NULL,
+            item_name TEXT NOT NULL DEFAULT '',
+            voucher_type TEXT NOT NULL DEFAULT '',
+            voucher_number TEXT NOT NULL DEFAULT '',
+            party_name TEXT,
+            quantity REAL DEFAULT 0,
+            amount REAL DEFAULT 0,
+            sync_month TEXT,
+            UNIQUE(company_id, item_name, date, voucher_type, voucher_number)
+        );
+        CREATE INDEX IF NOT EXISTS idx_stockledger_item ON stock_item_ledger(company_id, item_name, date);
+
+        -- ============================================
         -- SYNC LOG (Track extraction progress)
         -- ============================================
         CREATE TABLE IF NOT EXISTS sync_log (
@@ -267,6 +354,13 @@ function runMigrations(db) {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_vch_unique
         ON vouchers(company_id, date, voucher_type, COALESCE(voucher_number,''), COALESCE(ledger_name,''), amount)
     `);
+
+    // Migration M3: Add sync_modules column to companies
+    const cols = db.pragma('table_info(companies)').map(c => c.name);
+    if (!cols.includes('sync_modules')) {
+        db.exec("ALTER TABLE companies ADD COLUMN sync_modules TEXT DEFAULT '{}'");
+        console.log('[Migration M3] Added sync_modules column to companies.');
+    }
 }
 
 module.exports = { initDatabase, getDbPath, DB_DIR };

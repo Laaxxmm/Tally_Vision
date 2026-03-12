@@ -42,6 +42,37 @@ class DataExtractor {
         return chunks;
     }
 
+    // Quarter-level chunks: Apr-Jun, Jul-Sep, Oct-Dec, Jan-Mar
+    // 4 requests/year vs 12 — safe for trial_balance and stock_summary
+    generateQuarterChunks(fromDate, toDate) {
+        const chunks = [];
+        let current = new Date(fromDate + 'T00:00:00');
+        const end = new Date(toDate + 'T00:00:00');
+        // Quarter end months (0-indexed): Jun=5, Sep=8, Dec=11, Mar=2
+        const qEnd = [2, 5, 8, 11];
+        while (current <= end) {
+            const y = current.getFullYear();
+            const m = current.getMonth(); // 0-indexed
+            const qEndMonth = qEnd.find(e => e >= m) ?? 2; // next quarter-end month
+            const qEndYear = qEndMonth === 2 && m > 2 ? y + 1 : y;
+            const quarterEnd = new Date(qEndYear, qEndMonth + 1, 0); // last day of qEndMonth
+            const from = this.formatDate(current);
+            const to = this.formatDate(quarterEnd > end ? end : quarterEnd);
+            const label = `Q${Math.floor([3,3,3,0,0,0,1,1,1,2,2,2][m])+1} ${y}`.replace(
+                /Q(\d) (\d+)/, (_, q, yr) => `Q${[0,1,2,3].indexOf(+q-1) === -1 ? q : q} ${yr}`
+            );
+            chunks.push({ from, to, label: `${current.toLocaleString('en',{month:'short'})}-${quarterEnd.toLocaleString('en',{month:'short'})} ${qEndYear}` });
+            current = new Date(qEndYear, qEndMonth + 1, 1); // first day after quarter end
+        }
+        return chunks;
+    }
+
+    // Returns true if the period's end date is before the start of the current month
+    isHistoricalPeriod(toDate) {
+        const startOfMonth = new Date().toISOString().substring(0, 8) + '01';
+        return toDate < startOfMonth;
+    }
+
     formatDate(d) {
         return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
     }
@@ -165,6 +196,8 @@ class DataExtractor {
         for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
             try { return await fn(); }
             catch (err) {
+                // Tally offline — no point retrying, fail immediately
+                if (err.message === 'TALLY_NOT_RUNNING' || err.message === 'TALLY_TIMEOUT') throw err;
                 if (attempt === this.maxRetries) throw err;
                 console.warn(`[RETRY ${attempt}] ${label}: ${err.message}`);
                 await new Promise(r => setTimeout(r, 2000 * attempt));
@@ -201,10 +234,14 @@ class DataExtractor {
 
     async extractTrialBalance(companyId, companyName, fromDate, toDate, forceResync = false) {
         const chunks = this.generateMonthChunks(fromDate, toDate); let total = 0;
+        // FIX-20: Force resync purges ALL stale TB data (removes corrupted April anomaly + old quarterly rows)
+        if (forceResync) {
+            this.db.prepare('DELETE FROM trial_balance WHERE company_id = ?').run(companyId);
+        }
         for (let i = 0; i < chunks.length; i++) {
             const c = chunks[i];
             // Skip historical months already synced
-            if (!forceResync && this.isHistoricalMonth(c.from.substring(0, 7))) {
+            if (!forceResync && this.isHistoricalPeriod(c.to)) {
                 const exists = this.db.prepare('SELECT 1 FROM trial_balance WHERE company_id=? AND period_from=? LIMIT 1').get(companyId, c.from);
                 if (exists) {
                     this.onProgress({ step: 'trial-balance', status: 'running', message: `Trial Balance: ${c.label} (cached)`, progress: Math.round(((i+1)/chunks.length)*100) });
@@ -382,15 +419,63 @@ class DataExtractor {
                 progress: Math.round(((j + 1) / types.length) * 100) });
         }
 
+        // ── Phase 3: Catch-all pass (no type filter) ──────────────────────────
+        // Captures custom-named voucher types (e.g., "Purchases", "Bills") not in
+        // the standard list above. INSERT OR IGNORE silently skips already-inserted rows.
+        this.onProgress({ step: 'vouchers', status: 'running',
+            message: 'Vouchers: fetching all (catch-all for custom types)',
+            progress: 95 });
+        try {
+            const xmlAll = TEMPLATES['daybook'](
+                this.formatTallyDate(fromDate), this.formatTallyDate(toDate), companyName
+                // no voucherType argument → no filter → returns ALL types
+            );
+            console.log('[Sync] Requesting ALL vouchers (catch-all)...');
+            const t0 = Date.now();
+            const allRows = await this.withRetry(() => this.fetchVoucherCollection(xmlAll), 'V ALL');
+            console.log(`[Sync] ALL: got ${allRows.length} ledger rows in ${((Date.now()-t0)/1000).toFixed(1)}s`);
+
+            if (allRows.length > 0) {
+                const parsedAll = allRows.map(r => {
+                    let parsedDate = fromDate;
+                    if (r.date && r.date.length === 8 && /^\d{8}$/.test(r.date)) {
+                        parsedDate = r.date.substring(0, 4) + '-' + r.date.substring(4, 6) + '-' + r.date.substring(6, 8);
+                    } else if (r.date) {
+                        parsedDate = this.parseDate(r.date) || fromDate;
+                    }
+                    return { ...r, parsedDate };
+                });
+                let catchAllCount = 0;
+                for (const c of activeChunks) {
+                    const validRows = parsedAll.filter(r => r.parsedDate >= c.from && r.parsedDate <= c.to);
+                    if (!validRows.length) continue;
+                    this.db.transaction((vRows) => {
+                        for (const r of vRows) {
+                            const result = ins.run(companyId, r.parsedDate, r.voucherType || '',
+                                r.voucherNumber || '', r.ledgerName || '',
+                                r.amount, r.partyName, r.narration, c.syncMonth);
+                            if (result.changes > 0) catchAllCount++;
+                        }
+                    })(validRows);
+                }
+                if (catchAllCount > 0) {
+                    console.log(`[Sync] Catch-all: inserted ${catchAllCount} new rows from custom voucher types`);
+                    total += catchAllCount;
+                }
+            }
+        } catch (e) {
+            console.warn(`[Sync] Catch-all pass failed: ${e.message}`);
+        }
+
         this.logSync(companyId, 'vouchers', fromDate, toDate, 'success', total);
         return total;
     }
 
     async extractStockSummary(companyId, companyName, fromDate, toDate, forceResync = false) {
-        const chunks = this.generateMonthChunks(fromDate, toDate); let total = 0;
+        const chunks = this.generateQuarterChunks(fromDate, toDate); let total = 0;
         for (let i = 0; i < chunks.length; i++) {
             const c = chunks[i];
-            if (!forceResync && this.isHistoricalMonth(c.from.substring(0, 7))) {
+            if (!forceResync && this.isHistoricalPeriod(c.to)) {
                 const exists = this.db.prepare('SELECT 1 FROM stock_summary WHERE company_id=? AND period_from=? LIMIT 1').get(companyId, c.from);
                 if (exists) {
                     this.onProgress({ step: 'stock-summary', status: 'running', message: `Stock: ${c.label} (cached)`, progress: Math.round(((i+1)/chunks.length)*100) });
@@ -424,20 +509,249 @@ class DataExtractor {
         }
     }
 
+    // ── OPTIONAL MODULE EXTRACTORS ────────────────────────────────────────────
+    // Each method: catches all errors, logs "skipped" / "not available", returns 0.
+    // Never throws to parent sync — safe if Tally module is disabled.
+
+    async extractCostCentres(companyId, companyName) {
+        this.onProgress({ step: 'costCentres', status: 'running', message: 'Cost Centres: fetching master list...' });
+        try {
+            const xml = TEMPLATES['cost-centres'](companyName);
+            const rows = await this.withRetry(() => this.fetchReport(xml), 'CostCentres');
+            if (!rows.length) {
+                this.logSync(companyId, 'cost-centres', null, null, 'success', 0);
+                return 0;
+            }
+            this.db.prepare('DELETE FROM cost_centres WHERE company_id = ?').run(companyId);
+            const ins = this.db.prepare('INSERT OR REPLACE INTO cost_centres (company_id,name,parent,category) VALUES (?,?,?,?)');
+            this.db.transaction((rows) => {
+                for (const r of rows) ins.run(companyId, this.cleanString(r.F01), this.cleanString(r.F02), this.cleanString(r.F03));
+            })(rows);
+            this.logSync(companyId, 'cost-centres', null, null, 'success', rows.length);
+            return rows.length;
+        } catch (e) {
+            console.warn(`[Cost Centres] Not available or error: ${e.message}`);
+            this.logSync(companyId, 'cost-centres', null, null, 'error', 0, e.message);
+            return 0;
+        }
+    }
+
+    async extractCostAllocations(companyId, companyName, fromDate, toDate, forceResync = false) {
+        const chunks = this.generateQuarterChunks(fromDate, toDate);
+        let total = 0;
+        for (const c of chunks) {
+            if (!forceResync && this.isHistoricalPeriod(c.to)) {
+                const exists = this.db.prepare('SELECT 1 FROM cost_allocations WHERE company_id=? AND date=? LIMIT 1').get(companyId, c.to);
+                if (exists) continue;
+            }
+            this.onProgress({ step: 'costAlloc', status: 'running', message: `Cost Allocations: ${c.label}` });
+            try {
+                const xml = TEMPLATES['cost-allocations'](this.formatTallyDate(c.from), this.formatTallyDate(c.to), companyName);
+                const rows = await this.withRetry(() => this.fetchReport(xml), `CostAlloc ${c.label}`);
+                this.db.prepare('DELETE FROM cost_allocations WHERE company_id=? AND date=? AND sync_month=?').run(companyId, c.to, c.from.substring(0, 7));
+                const ins = this.db.prepare('INSERT OR IGNORE INTO cost_allocations (company_id,date,ledger_name,cost_centre,amount,sync_month) VALUES (?,?,?,?,?,?)');
+                this.db.transaction((rows) => {
+                    for (const r of rows) {
+                        const ledger = this.cleanString(r.F01);
+                        const cc = this.cleanString(r.F02);
+                        if (cc) ins.run(companyId, c.to, ledger, cc, this.parseNumber(r.F04), c.from.substring(0, 7));
+                    }
+                })(rows);
+                total += rows.length;
+                this.logSync(companyId, 'cost-allocations', c.from, c.to, 'success', rows.length);
+            } catch (e) {
+                console.warn(`[Cost Alloc ${c.label}] Not available: ${e.message}`);
+                this.logSync(companyId, 'cost-allocations', c.from, c.to, 'error', 0, e.message);
+            }
+        }
+        return total;
+    }
+
+    async extractGstEntries(companyId, companyName, fromDate, toDate, forceResync = false) {
+        // Fetch Sales/Purchase/CN/DN vouchers and store as GST entries.
+        // Reuses fetchVoucherCollection (daybook template) — no extra Tally requests
+        // if these voucher types were already fetched; this module adds separate storage.
+        const chunks = this.generateMonthChunks(fromDate, toDate);
+        const gstTypes = ['Sales', 'Purchase', 'Credit Note', 'Debit Note'];
+        let total = 0;
+
+        const ins = this.db.prepare(
+            'INSERT OR IGNORE INTO gst_entries (company_id,date,voucher_type,voucher_number,party_name,amount,sync_month) VALUES (?,?,?,?,?,?,?)'
+        );
+        // Use amount column mapped from taxable_value for basic tracking
+        // (full GST split extraction to be added in future with dedicated TDL)
+        const insGst = this.db.prepare(
+            'INSERT OR IGNORE INTO gst_entries (company_id,date,voucher_type,voucher_number,party_name,taxable_value,sync_month) VALUES (?,?,?,?,?,?,?)'
+        );
+
+        for (const c of chunks) {
+            const syncMonth = c.from.substring(0, 7);
+            if (!forceResync && this.isHistoricalMonth(syncMonth)) {
+                const exists = this.db.prepare('SELECT 1 FROM gst_entries WHERE company_id=? AND sync_month=? LIMIT 1').get(companyId, syncMonth);
+                if (exists) continue;
+            }
+            this.onProgress({ step: 'gst', status: 'running', message: `GST Entries: ${c.label}` });
+            this.db.prepare('DELETE FROM gst_entries WHERE company_id=? AND sync_month=?').run(companyId, syncMonth);
+            for (const vt of gstTypes) {
+                try {
+                    const xml = TEMPLATES['daybook'](this.formatTallyDate(c.from), this.formatTallyDate(c.to), companyName, vt);
+                    const rows = await this.withRetry(() => this.fetchVoucherCollection(xml), `GST ${vt} ${c.label}`);
+                    // Aggregate to voucher level (sum of debit entries = taxable value proxy)
+                    const voucherMap = new Map();
+                    for (const r of rows) {
+                        const key = `${r.date}||${r.voucherNumber}`;
+                        if (!voucherMap.has(key)) voucherMap.set(key, { ...r, totalAmt: 0 });
+                        if (r.amount > 0) voucherMap.get(key).totalAmt += r.amount;
+                    }
+                    this.db.transaction((entries) => {
+                        for (const [, v] of entries) {
+                            const d = v.date && v.date.length === 8 ? `${v.date.substring(0,4)}-${v.date.substring(4,6)}-${v.date.substring(6,8)}` : (this.parseDate(v.date) || c.from);
+                            if (d >= c.from && d <= c.to) {
+                                insGst.run(companyId, d, v.voucherType, v.voucherNumber || '', v.partyName || '', v.totalAmt, syncMonth);
+                                total++;
+                            }
+                        }
+                    })(voucherMap);
+                } catch (e) {
+                    console.warn(`[GST ${vt} ${c.label}] ${e.message}`);
+                }
+            }
+            this.logSync(companyId, 'gst-entries', c.from, c.to, 'success', total);
+        }
+        return total;
+    }
+
+    async extractPayroll(companyId, companyName, fromDate, toDate, forceResync = false) {
+        const chunks = this.generateMonthChunks(fromDate, toDate);
+        let total = 0;
+        const ins = this.db.prepare(
+            'INSERT OR IGNORE INTO payroll_entries (company_id,date,voucher_number,employee_name,pay_head,amount,sync_month) VALUES (?,?,?,?,?,?,?)'
+        );
+        for (const c of chunks) {
+            const syncMonth = c.from.substring(0, 7);
+            if (!forceResync && this.isHistoricalMonth(syncMonth)) {
+                const exists = this.db.prepare('SELECT 1 FROM payroll_entries WHERE company_id=? AND sync_month=? LIMIT 1').get(companyId, syncMonth);
+                if (exists) continue;
+            }
+            this.onProgress({ step: 'payroll', status: 'running', message: `Payroll: ${c.label}` });
+            try {
+                const xml = TEMPLATES['daybook'](this.formatTallyDate(c.from), this.formatTallyDate(c.to), companyName, 'Payroll');
+                const rows = await this.withRetry(() => this.fetchVoucherCollection(xml), `Payroll ${c.label}`);
+                if (!rows.length) {
+                    this.logSync(companyId, 'payroll', c.from, c.to, 'success', 0);
+                    continue;
+                }
+                this.db.prepare('DELETE FROM payroll_entries WHERE company_id=? AND sync_month=?').run(companyId, syncMonth);
+                this.db.transaction((rows) => {
+                    for (const r of rows) {
+                        const d = r.date && r.date.length === 8
+                            ? `${r.date.substring(0,4)}-${r.date.substring(4,6)}-${r.date.substring(6,8)}`
+                            : (this.parseDate(r.date) || c.from);
+                        if (d >= c.from && d <= c.to) {
+                            ins.run(companyId, d, r.voucherNumber || '', r.partyName || '', r.ledgerName || '', r.amount, syncMonth);
+                            total++;
+                        }
+                    }
+                })(rows);
+                this.logSync(companyId, 'payroll', c.from, c.to, 'success', rows.length);
+            } catch (e) {
+                console.warn(`[Payroll ${c.label}] Not available: ${e.message}`);
+                this.logSync(companyId, 'payroll', c.from, c.to, 'error', 0, e.message);
+            }
+        }
+        return total;
+    }
+
+    // On-demand stock item ledger — not in runFullSync, called by API endpoint.
+    async extractStockItemLedger(companyId, companyName, itemName, fromDate, toDate) {
+        this.onProgress({ step: 'stockLedger', status: 'running', message: `Stock Ledger: ${itemName}...` });
+        try {
+            const xml = TEMPLATES['stock-item-ledger'](
+                this.formatTallyDate(fromDate), this.formatTallyDate(toDate), companyName
+            );
+            const response = await this.tally.sendXML(xml);
+            if (!response) throw new Error('Empty response from Tally');
+
+            const parser = new (require('fast-xml-parser').XMLParser)({
+                ignoreAttributes: false,
+                attributeNamePrefix: '@_',
+                parseTagValue: false,
+                isArray: (t) => ['VOUCHER', 'ALLLEDGERENTRIES.LIST', 'ALLINVENTORYENTRIES.LIST'].includes(t)
+            });
+            const parsed = parser.parse(response);
+            const collection = parsed?.ENVELOPE?.BODY?.DATA?.COLLECTION;
+            if (!collection) return 0;
+
+            const txt = (v) => (v === null || v === undefined) ? '' : typeof v === 'object' ? String(v['#text'] || '') : String(v);
+            const num = (v) => {
+                const s = txt(v).trim();
+                const isNeg = /^\(.*\)$/.test(s);
+                const clean = parseFloat(s.replace(/[^\d.\-]/g, '')) || 0;
+                return isNeg ? -Math.abs(clean) : clean;
+            };
+
+            const vouchers = collection['VOUCHER'] || [];
+            const ins = this.db.prepare(
+                'INSERT OR IGNORE INTO stock_item_ledger (company_id,date,item_name,voucher_type,voucher_number,party_name,quantity,amount,sync_month) VALUES (?,?,?,?,?,?,?,?,?)'
+            );
+
+            this.db.prepare('DELETE FROM stock_item_ledger WHERE company_id=? AND item_name=? AND date>=? AND date<=?')
+                .run(companyId, itemName, fromDate, toDate);
+
+            let total = 0;
+            this.db.transaction((vouchers) => {
+                for (const v of vouchers) {
+                    const date = (() => {
+                        const d = txt(v.DATE);
+                        if (d.length === 8 && /^\d{8}$/.test(d)) return `${d.substring(0,4)}-${d.substring(4,6)}-${d.substring(6,8)}`;
+                        return this.parseDate(d) || fromDate;
+                    })();
+                    if (date < fromDate || date > toDate) continue;
+
+                    const vt = txt(v.VOUCHERTYPENAME);
+                    const vn = txt(v.VOUCHERNUMBER);
+                    const party = txt(v.PARTYLEDGERNAME);
+                    const syncMonth = date.substring(0, 7);
+
+                    const invEntries = v['ALLINVENTORYENTRIES.LIST'] || [];
+                    for (const ie of invEntries) {
+                        const iName = txt(ie.STOCKITEMNAME);
+                        if (!iName || iName.toLowerCase() !== itemName.toLowerCase()) continue;
+                        const qty = num(ie.ACTUALQTY || ie.BILLEDQTY);
+                        const amt = num(ie.AMOUNT);
+                        ins.run(companyId, date, itemName, vt, vn, party, qty, amt, syncMonth);
+                        total++;
+                    }
+                }
+            })(vouchers);
+
+            this.logSync(companyId, 'stock-item-ledger', fromDate, toDate, 'success', total);
+            return total;
+        } catch (e) {
+            console.warn(`[StockItemLedger] Error: ${e.message}`);
+            this.logSync(companyId, 'stock-item-ledger', fromDate, toDate, 'error', 0, e.message);
+            return 0;
+        }
+    }
+
     async runFullSync(companyId, companyName, fromDate, toDate, options = {}) {
         const forceResync = options.forceResync || false;
         const start = Date.now(); const results = { success: true, errors: [], counts: {}, forceResync };
         this.onProgress({ step: 'init', status: 'running', message: `Syncing ${companyName}: ${fromDate} to ${toDate}${forceResync ? ' (force)' : ' (incremental)'}` });
 
+        const modules = options.syncModules || {};
         const steps = [
-            ['groups', () => this.extractChartOfAccounts(companyId, companyName)],
-            ['ledgers', () => this.extractLedgers(companyId, companyName)],
-            ['trialBalance', () => this.extractTrialBalance(companyId, companyName, fromDate, toDate, forceResync)],
-            ['profitLoss', () => this.extractProfitLoss(companyId, companyName, fromDate, toDate, forceResync)],
-            ['balanceSheet', () => this.extractBalanceSheet(companyId, companyName, fromDate, toDate, forceResync)],
-            ['stockSummary', () => this.extractStockSummary(companyId, companyName, fromDate, toDate, forceResync)],
-            ['vouchers', () => this.extractVouchers(companyId, companyName, fromDate, toDate, forceResync)],
-            ['bills', () => this.extractBillsOutstanding(companyId, companyName, toDate)],
+            ['groups',        () => this.extractChartOfAccounts(companyId, companyName)],
+            ['ledgers',       () => this.extractLedgers(companyId, companyName)],
+            ['trialBalance',  () => this.extractTrialBalance(companyId, companyName, fromDate, toDate, forceResync)],
+            ['stockSummary',  () => this.extractStockSummary(companyId, companyName, fromDate, toDate, forceResync)],
+            ['vouchers',      () => this.extractVouchers(companyId, companyName, fromDate, toDate, forceResync)],
+            ['bills',         () => this.extractBillsOutstanding(companyId, companyName, toDate)],
+            // Optional modules — only run when enabled per company
+            ...(modules.gst         ? [['gst',          () => this.extractGstEntries(companyId, companyName, fromDate, toDate, forceResync)]] : []),
+            ...(modules.costCentres ? [['costCentres',   () => this.extractCostCentres(companyId, companyName)],
+                                       ['costAlloc',     () => this.extractCostAllocations(companyId, companyName, fromDate, toDate, forceResync)]] : []),
+            ...(modules.payroll     ? [['payroll',       () => this.extractPayroll(companyId, companyName, fromDate, toDate, forceResync)]] : []),
         ];
 
         for (const [name, fn] of steps) {

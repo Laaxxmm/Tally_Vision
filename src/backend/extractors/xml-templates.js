@@ -122,9 +122,78 @@ ${filterBlock}
 <COLLECTION NAME="C1"><TYPE>StockItem</TYPE></COLLECTION>`
     ),
 
+    // ── OPTIONAL MODULE TEMPLATES ─────────────────────────────────────────────
+
+    // Cost Centre master list — single request
+    'cost-centres': (company) => xmlWrap('TVCostCtr', 'TVCostCtrF', 'TVCostCtrP',
+        companyBlock(company),
+        `<PART NAME="TVCostCtrP"><LINES>L1</LINES><REPEAT>L1:CCostCtr</REPEAT><SCROLLED>Vertical</SCROLLED></PART>
+<LINE NAME="L1"><FIELDS>F01,F02,F03</FIELDS><XMLTAG>ROW</XMLTAG></LINE>
+<FIELD NAME="F01"><SET>$Name</SET><XMLTAG>F01</XMLTAG></FIELD>
+<FIELD NAME="F02"><SET>$Parent</SET><XMLTAG>F02</XMLTAG></FIELD>
+<FIELD NAME="F03"><SET>$Category</SET><XMLTAG>F03</XMLTAG></FIELD>
+<COLLECTION NAME="CCostCtr"><TYPE>CostCentre</TYPE></COLLECTION>`
+    ),
+
+    // Cost Allocations — period totals per ledger + cost centre using WALK.
+    // TYPE=Ledger → WALK=CostCentreDetails gives each ledger's cost centre split.
+    // VARIABLE captures ledger name before walking into CostCentreDetails.
+    // If cost centres are disabled, Tally returns empty rows — safe.
+    'cost-allocations': (fromDate, toDate, company) => {
+        const SC = '<' + '/SYSTEM>';
+        return `<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+<HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>TVCostAlloc</ID></HEADER>
+<BODY><DESC>
+<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+<SVFROMDATE>${fromDate}</SVFROMDATE><SVTODATE>${toDate}</SVTODATE>${companyBlock(company)}</STATICVARIABLES>
+<TDL><TDLMESSAGE>
+<REPORT NAME="TVCostAlloc"><FORMS>TVCostAllocF</FORMS></REPORT>
+<FORM NAME="TVCostAllocF"><PARTS>TVCostAllocP</PARTS><XMLTAG>DATA</XMLTAG></FORM>
+<PART NAME="TVCostAllocP"><LINES>TVCostAllocL</LINES><REPEAT>TVCostAllocL:CCostAlloc</REPEAT><SCROLLED>Vertical</SCROLLED></PART>
+<LINE NAME="TVCostAllocL"><FIELDS>F01,F02,F03,F04</FIELDS><XMLTAG>ROW</XMLTAG></LINE>
+<FIELD NAME="F01"><SET>##CurLedName</SET><XMLTAG>F01</XMLTAG></FIELD>
+<FIELD NAME="F02"><SET>$CostCentreName</SET><XMLTAG>F02</XMLTAG></FIELD>
+<FIELD NAME="F03"><SET>$Category</SET><XMLTAG>F03</XMLTAG></FIELD>
+<FIELD NAME="F04"><SET>if $$IsDebit:$Amount then -$$NumValue:$Amount else $$NumValue:$Amount</SET><XMLTAG>F04</XMLTAG></FIELD>
+<COLLECTION NAME="CCostAlloc"><TYPE>Ledger</TYPE>
+<VARIABLE>CurLedName</VARIABLE><WALK>CostCentreDetails</WALK>
+<FILTERS>TVCostNonZero</FILTERS></COLLECTION>
+<SYSTEM TYPE="Formulae" NAME="TVCostNonZero">$$NumValue:$Amount != 0${SC}
+<VARIABLE NAME="CurLedName" USE="Name Field"/>
+</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+    },
+
+    // Stock Item Ledger — per-item transaction statement using NATIVEMETHOD AllInventoryEntries.
+    // On-demand only (not in runFullSync). itemName must be exact Tally stock item name.
+    // Extractor filters for the specific item from the returned inventory entries.
+    'stock-item-ledger': (fromDate, toDate, company) => {
+        const SC = '<' + '/SYSTEM>';
+        return `<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+<HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>TVStockLedger</ID></HEADER>
+<BODY><DESC>
+<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+<SVFROMDATE>${fromDate}</SVFROMDATE><SVTODATE>${toDate}</SVTODATE>${companyBlock(company)}</STATICVARIABLES>
+<TDL><TDLMESSAGE>
+<COLLECTION NAME="TVStockLedger"><TYPE>Voucher</TYPE>
+<NATIVEMETHOD>Date,VoucherTypeName,VoucherNumber,PartyLedgerName,Amount</NATIVEMETHOD>
+<NATIVEMETHOD>AllInventoryEntries</NATIVEMETHOD>
+<FILTER>TVNoCancel,TVNoOptional</FILTER>
+</COLLECTION>
+<SYSTEM TYPE="Formulae" NAME="TVNoCancel">NOT $IsCancelled${SC}
+<SYSTEM TYPE="Formulae" NAME="TVNoOptional">NOT $IsOptional${SC}
+</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+    },
+
+    // ── BILLS OUTSTANDING ─────────────────────────────────────────────────────
     'bills-outstanding': (toDate, nature, company) => {
         const groupName = nature.toLowerCase().startsWith('r') ? 'Sundry Debtors' : 'Sundry Creditors';
         const SC = '<' + '/SYSTEM>';
+        // WALK flattens Ledger→BillAllocations into one collection.
+        // VARIABLE captures the parent Ledger name before walking each ledger's bills.
+        // REPEAT is on PART (the only valid location in TDL — not LINE).
+        // $$IsBlank guard prevents $$Age crash on bills with no date.
         return `<?xml version="1.0" encoding="utf-8"?>
 <ENVELOPE>
 <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>TVBills</ID></HEADER>
@@ -134,21 +203,18 @@ ${filterBlock}
 <TDL><TDLMESSAGE>
 <REPORT NAME="TVBills"><FORMS>TVBillsF</FORMS></REPORT>
 <FORM NAME="TVBillsF"><PARTS>TVBillsP</PARTS><XMLTAG>DATA</XMLTAG></FORM>
-<PART NAME="TVBillsP"><LINES>TVBillsL</LINES><REPEAT>TVBillsL:CLedgers</REPEAT><SCROLLED>Vertical</SCROLLED></PART>
-<LINE NAME="TVBillsL"><PARTS>TVBillAllocP</PARTS></LINE>
-<PART NAME="TVBillAllocP"><LINES>TVBillAllocL</LINES><REPEAT>TVBillAllocL:CBillAllocs</REPEAT><SCROLLED>Vertical</SCROLLED></PART>
-<LINE NAME="TVBillAllocL"><FIELDS>F01,F02,F03,F04,F05</FIELDS><XMLTAG>ROW</XMLTAG></LINE>
-<FIELD NAME="F01"><USE>Short Date Field</USE><SET>$BillDate</SET><XMLTAG>F01</XMLTAG></FIELD>
+<PART NAME="TVBillsP"><LINES>TVBillsL</LINES><REPEAT>TVBillsL:CBills</REPEAT><SCROLLED>Vertical</SCROLLED></PART>
+<LINE NAME="TVBillsL"><FIELDS>F01,F02,F03,F04,F05</FIELDS><XMLTAG>ROW</XMLTAG></LINE>
+<FIELD NAME="F01"><SET>$BillDate</SET><XMLTAG>F01</XMLTAG></FIELD>
 <FIELD NAME="F02"><SET>$Name</SET><XMLTAG>F02</XMLTAG></FIELD>
 <FIELD NAME="F03"><SET>if $$IsDebit:$Amount then -$$NumValue:$Amount else $$NumValue:$Amount</SET><XMLTAG>F03</XMLTAG></FIELD>
-<FIELD NAME="F04"><SET>##CurLedgerName</SET><XMLTAG>F04</XMLTAG></FIELD>
-<FIELD NAME="F05"><SET>$$NumValue:$$Age:$BillDate:ToDate</SET><XMLTAG>F05</XMLTAG></FIELD>
-<COLLECTION NAME="CLedgers"><TYPE>Ledger</TYPE><CHILDOF>${groupName}</CHILDOF>
-<VARIABLE>CurLedgerName</VARIABLE></COLLECTION>
-<COLLECTION NAME="CBillAllocs"><TYPE>BillAllocations</TYPE><BELONGSTO>Yes</BELONGSTO>
+<FIELD NAME="F04"><SET>##CurLedName</SET><XMLTAG>F04</XMLTAG></FIELD>
+<FIELD NAME="F05"><SET>if $$IsBlank:$BillDate then 0 else $$NumValue:$$Age:$BillDate:$$AsOnDate</SET><XMLTAG>F05</XMLTAG></FIELD>
+<COLLECTION NAME="CBills"><TYPE>Ledger</TYPE><CHILDOF>${groupName}</CHILDOF>
+<VARIABLE>CurLedName</VARIABLE><WALK>BillAllocations</WALK>
 <FILTERS>TVBillOutstanding</FILTERS></COLLECTION>
 <SYSTEM TYPE="Formulae" NAME="TVBillOutstanding">$$NumValue:$Amount != 0${SC}
-<VARIABLE NAME="CurLedgerName" USE="Name Field"/>
+<VARIABLE NAME="CurLedName" USE="Name Field"/>
 </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
     }
 };
