@@ -1,344 +1,398 @@
-# TallyVision — Project Handoff Document
-**Version:** 1.0.0 (GitHub tag: `v1`)
+# TallyVision — Developer Handoff Document
+
+**Version:** 2.1.0 (v2.1.0 — FIX-23)
 **Date:** March 2026
 **Repo:** https://github.com/Laaxxmm/Tally_Vision
-**Stack:** Node.js + Express · better-sqlite3 · Chart.js · Tailwind CSS
+**Stack:** Node.js + Express, better-sqlite3, Chart.js, Tailwind CSS
 **Dashboard:** http://localhost:3456
 **Tally Port:** 9000 (default)
 
 ---
 
-## 1. What This Project Does
-
-TallyVision is a **local MIS dashboard** that connects to Tally Prime / ERP 9, extracts financial data via Tally's XML-over-HTTP API, stores it in a local SQLite database, and displays it on a single-page web dashboard. No cloud, no third-party servers — everything runs on the same machine as Tally.
-
-**What the dashboard shows:**
-- KPI tiles: Revenue, Purchase, Direct Expenses, Indirect Expenses, Gross Profit, Net Profit, Receivables, Payables, Cash & Bank, Loans
-- Revenue vs Expenses monthly trend chart
-- Net Profit trend chart
-- Top 10 Expenses (bar chart)
-- Top 10 Revenue Sources (bar chart)
-- Receivable Ageing (by party, bucketed 0–30 / 31–60 / 61–90 / 90+ days)
-- Payable Ageing (same structure)
-- Stock Summary (top items by closing value)
-- Trial Balance viewer
-
----
-
-## 2. Architecture
+## 1. How It Works (End-to-End Flow)
 
 ```
-Tally Prime / ERP 9
-  │  HTTP POST port 9000, XML request (utf-16le encoded)
-  ▼
-TallyConnector   ← src/backend/tally-connector.js
-  │  Parses utf-16le XML response, handles timeouts + retries
-  ▼
-DataExtractor    ← src/backend/extractors/data-extractor.js
-  │  Chunked extraction engine (month-by-month for most reports)
-  │  Fetch-once-per-type for vouchers (8 Tally requests per FY sync)
-  │  Smart-skip: historical cached months are never re-fetched
-  ▼
-SQLite DB        ← D:\Tally\TallyVision\data\tallyvision.db
-  │  WAL mode, all financial data stored locally
-  ▼
-Express REST API ← src/backend/server.js
-  │  Dynamic TB engine (in-memory ledger→group map, no SQL JOINs)
-  ▼
-dashboard.html   ← src/frontend/dashboard.html
-     Single-page app, Chart.js + Tailwind CSS, polling-based sync progress
+User clicks "Sync" in dashboard
+    |
+    v
+POST /api/sync/start { companyName, fromDate, toDate, forceResync }
+    |
+    v
+DataExtractor.runFullSync()
+    |-- extractChartOfAccounts()      1 request   → account_groups table
+    |-- extractLedgers()              1 request   → ledgers table
+    |-- extractTrialBalance()         12 requests → trial_balance table (monthly)
+    |-- extractVouchers()             12 requests → vouchers table (monthly, bare API)
+    |-- extractStockSummary()         4 requests  → stock_summary table (quarterly)
+    |-- extractBillsOutstanding()     2 requests  → bills_outstanding table (recv + pay)
+    |-- [optional] extractGstEntries()
+    |-- [optional] extractCostAllocations()
+    |-- [optional] extractPayroll()
+    |
+    v
+SQLite DB populated → REST API serves computed KPIs/charts → Dashboard renders
 ```
 
----
-
-## 3. File Structure
-
-```
-D:\Tally\TallyVision\
-├── src/
-│   ├── backend/
-│   │   ├── server.js                  ← Express REST API (v4 — Dynamic TB engine)
-│   │   ├── tally-connector.js         ← TCP ping + XML send/receive (utf-16le)
-│   │   ├── run-extraction.js          ← CLI runner for manual extraction
-│   │   ├── db/
-│   │   │   └── setup.js               ← SQLite schema + migrations
-│   │   └── extractors/
-│   │       ├── data-extractor.js      ← Core extraction engine
-│   │       └── xml-templates.js       ← All TDL XML request templates
-│   └── frontend/
-│       └── dashboard.html             ← Single-page dashboard (SPA)
-├── data/
-│   └── tallyvision.db                 ← SQLite database (not in git)
-├── package.json
-├── install.bat
-├── .gitignore
-├── .claude/launch.json                ← Claude Code preview config
-├── README.md
-├── CHANGES.md                         ← Per-fix change log
-└── HANDOFF.md                         ← This file
-```
+**Total Tally requests per full sync:** ~32 (+ optional modules)
 
 ---
 
-## 4. How to Run
+## 2. File-by-File Guide
 
-```bash
-# Install dependencies (first time only)
-npm install
+### `src/backend/server.js` (~1,117 lines)
+The Express REST API and the **Dynamic TB Engine**.
 
-# Start the server
-npm start
-# → http://localhost:3456
+**Core engine functions (top of file):**
+- `buildLedgerGroupMap(companyId)` — Creates `Map<ledger_name, group_name>` from trial_balance. ~8ms. Used by all KPI and drill-down endpoints.
+- `buildPLGroupSets(companyId)` — Classifies all P&L groups into 4 sets using account_groups metadata:
+  - `directCredit` (PL + Credit + AffectsGrossProfit) = Sales, Direct Incomes
+  - `directDebit` (PL + Debit + AffectsGrossProfit) = Purchases, Direct Expenses
+  - `indirectCredit` (PL + Credit + !AffectsGrossProfit) = Indirect Incomes
+  - `indirectDebit` (PL + Debit + !AffectsGrossProfit) = Indirect Expenses
+- `getGroupTree(companyId, parentName)` — Recursive walker returning all descendant group names
+- `getTBSupplement(companyId, from, to)` — Monthly TB query with dedup (shortest period_to per period_from)
+- `computePLFlow(vouchersByLedger, lgMap, groupSet)` — Sums voucher amounts for ledgers matching a group set
+- `computeBSClosing(companyId, asOfDate, groupNames, balanceFilter, lgMap)` — TB opening + voucher movements for BS items
+- `getMonthlyVouchers(companyId, from, to)` — Aggregates voucher amounts by month+ledger
 
-# OR via Claude Code Preview (configured in .claude/launch.json)
-# Uses autoPort: false, always binds to 3456
-```
+**KPI endpoint (`/api/dashboard/kpi`):**
+Uses a **hybrid TB + voucher** approach:
+1. Sum voucher flows per P&L group set
+2. Get TB supplement (monthly totals)
+3. For each TB row, compute `Math.max(0, tbAmount + voucherSum)` — the clamp prevents double-counting
+4. Sum debit/credit groups separately for GP and NP
 
-**Tally must be open** with at least one company loaded and the XML export port enabled (Gateway of Tally → F12 → Advanced Configuration → Enable ODBC server = Yes, Port = 9000).
+**Monthly trend endpoint (`/api/dashboard/monthly-trend`):**
+Uses **TB data only** (not vouchers). Reason: Purchase vouchers lack `AllLedgerEntries` expansion in Tally's Collection API, so voucher-based Purchase amounts map to party names (BS groups) instead of P&L groups. TB is authoritative.
 
----
+**Group breakdown endpoint (`/api/dashboard/group-breakdown`):**
+Supports two modes:
+- `classType` param (revenue, directexp, indirectexp, indirectinc) — P&L drill-down
+- `groupRoot` param (Cash-in-Hand, Bank Accounts, etc.) — BS drill-down
 
-## 5. SQLite Database Schema
+Returns `{ children: [{ name, type: 'group'|'ledger', amount }] }` for hierarchical navigation.
 
-**Location:** `D:\Tally\TallyVision\data\tallyvision.db`
-**Override with env var:** `TALLYVISION_DATA=/your/path npm start`
+### `src/backend/tally-connector.js`
+TCP/XML communication with Tally.
 
-| Table | Purpose | Key Columns |
-|---|---|---|
-| `app_settings` | Key-value config store | `key`, `value` |
-| `license` | License management (stub for v1) | `license_key`, `max_companies`, `valid_until` |
-| `companies` | One row per synced Tally company | `name`, `fy_from`, `fy_to`, `last_full_sync_at` |
-| `account_groups` | Chart of Accounts hierarchy | `group_name`, `parent_group`, `bs_pl`, `dr_cr`, `affects_gross_profit` |
-| `ledgers` | Ledger master list | `name`, `group_name`, `parent_group` |
-| `trial_balance` | Monthly TB snapshots | `period_from`, `period_to`, `ledger_name`, `opening_balance`, `net_debit`, `net_credit`, `closing_balance` |
-| `profit_loss` | Monthly P&L snapshots | `period_from`, `period_to`, `ledger_name`, `group_name`, `amount` |
-| `balance_sheet` | Month-end BS snapshots | `as_on_date`, `ledger_name`, `group_name`, `closing_balance` |
-| `vouchers` | Transaction-level daybook | `date`, `voucher_type`, `voucher_number`, `ledger_name`, `amount`, `party_name`, `narration`, `sync_month` |
-| `stock_summary` | Monthly stock item snapshots | `item_name`, `stock_group`, `opening_qty/value`, `inward_qty/value`, `outward_qty/value`, `closing_qty/value` |
-| `bills_outstanding` | Periodic receivable/payable snapshots | `nature`, `bill_date`, `reference_number`, `outstanding_amount`, `party_name`, `overdue_days` |
-| `sync_log` | Extraction audit trail | `report_type`, `period_from`, `period_to`, `row_count`, `status`, `error_message`, `duration_ms` |
+- `ping()` — TCP socket check (fast, doesn't send XML)
+- `sendXML(xml)` — Sends UTF-16LE encoded XML, receives and parses response
+- `getCompanies()` — Fetches open companies from Tally
 
-**Key constraints:**
-- `vouchers` has `UNIQUE INDEX` on `(company_id, date, voucher_type, COALESCE(voucher_number,''), COALESCE(ledger_name,''), amount)` — prevents duplicate rows on re-sync
-- All tables have `company_id` FK to `companies(id)` with `ON DELETE CASCADE`
-- WAL mode + NORMAL synchronous for performance
+**Critical:** All requests/responses must be UTF-16LE encoded. Tally ignores or corrupts UTF-8.
 
----
+### `src/backend/extractors/xml-templates.js` (~213 lines)
+TDL XML templates for every Tally report.
 
-## 6. API Endpoints
+| Template | Tally API Type | Notes |
+|----------|---------------|-------|
+| `list-masters` | Collection | Generic master list (Groups, Ledgers, etc.) |
+| `chart-of-accounts` | Collection | Group hierarchy with bs_pl, dr_cr, affects_gross_profit |
+| `trial-balance` | Data (Report) | Respects date ranges, monthly chunks |
+| `profit-loss` | Data (Report) | Kept for compat, not used in sync |
+| `balance-sheet` | Data (Report) | Kept for compat, not used in sync |
+| `daybook` | Collection | **Bare API** — no filters, no AllLedgerEntries in NATIVEMETHOD |
+| `stock-summary` | Collection | Quarterly chunks |
+| `cost-centres` | Collection | Optional module |
+| `cost-allocations` | Collection | WALK=CostCentreDetails |
+| `bills-outstanding` | Collection | WALK=BillAllocations with $$Age for overdue days |
+| `stock-item-ledger` | Collection | On-demand, single stock item |
 
-| Method | Endpoint | Description |
-|---|---|---|
-| GET | `/api/status` | Tally connectivity + company list from DB |
-| POST | `/api/tally/connect` | Test/set Tally host+port |
-| GET | `/api/tally/companies` | Live company list from Tally |
-| POST | `/api/sync/start` | Start full sync `{companyName, fromDate, toDate, forceResync}` |
-| GET | `/api/sync/progress` | Poll sync progress (step, message, %) |
-| GET | `/api/sync/log` | Last 100 sync log entries |
-| GET | `/api/companies` | Companies from local DB |
-| GET | `/api/dashboard/kpi` | All KPI tiles `?companyId&fromDate&toDate` |
-| GET | `/api/dashboard/monthly-trend` | Revenue/Expense/Profit by month |
-| GET | `/api/dashboard/top-expenses` | Top 10 expense ledgers |
-| GET | `/api/dashboard/top-revenue` | Top 10 revenue sources |
-| GET | `/api/dashboard/expense-categories` | Expense by group |
-| GET | `/api/dashboard/revenue-categories` | Revenue by group |
-| GET | `/api/dashboard/receivable-ageing` | Debtor ageing by party |
-| GET | `/api/dashboard/payable-ageing` | Creditor ageing by party |
-| GET | `/api/dashboard/stock-summary` | Top stock items by closing value |
-| GET | `/api/dashboard/trial-balance` | Full TB for date range |
-| GET/POST | `/api/settings` | Read/write app_settings |
+### `src/backend/extractors/data-extractor.js` (~730 lines)
+Chunked extraction engine.
 
----
+**Key methods:**
+- `fetchReport(xml)` — Parses standard Tally report XML
+- `fetchVoucherCollection(xml)` — Parses voucher collection with AllLedgerEntries expansion. When no AllLedgerEntries present (Purchase vouchers), uses `partyName` as `ledgerName` fallback.
+- `generateMonthChunks(from, to)` — Splits FY into 12 monthly periods
+- `generateQuarterChunks(from, to)` — Splits FY into 4 quarterly periods
+- `extractVouchers()` — 12 monthly requests, bare Collection API, no per-type loop
+- `extractGstEntries()` — Fetches all vouchers monthly, filters GST types in JS
+- `extractPayroll()` — Fetches all vouchers monthly, filters `voucherType === 'Payroll'` in JS
+- `runFullSync()` — Orchestrator calling all extractors with progress callbacks
 
-## 7. KPI / P&L Formula
+### `src/backend/db/setup.js`
+SQLite schema with 14 tables and 3 migrations.
 
-```
-Revenue         = sum of voucher amounts under "Sales Accounts" group tree
-Direct Incomes  = sum under "Direct Incomes" group tree
-Purchase        = sum under "Purchase Accounts" group tree (negated)
-Direct Expenses = sum under "Direct Expenses" group tree (negated)
+**Key tables:**
+| Table | Extraction | Notes |
+|-------|-----------|-------|
+| `account_groups` | 1 request | CoA hierarchy with classification metadata |
+| `ledgers` | 1 request | GL master list |
+| `trial_balance` | 12 monthly | UNIQUE per company+period+ledger |
+| `vouchers` | 12 monthly | Indexed by company+date+ledger |
+| `stock_summary` | 4 quarterly | Opening/closing qty and value |
+| `bills_outstanding` | 2 requests | Receivable + Payable with overdue days |
 
-Gross Profit    = Revenue + Direct Incomes − Purchase − Direct Expenses
+**Migrations:**
+- M1: Added indexes on vouchers
+- M2: Added sync_log table
+- M3: Added `sync_modules` column to companies
 
-Indirect Incomes  = sum under "Indirect Incomes" group tree
-Indirect Expenses = sum under "Indirect Expenses" group tree (negated)
+### `src/frontend/dashboard.html` (~1,475 lines)
+Single-page application. Vanilla JS, no framework.
 
-Net Profit      = Gross Profit + Indirect Incomes − Indirect Expenses
-```
+**Layout sections:**
+1. **Header** — Company selector, connection status, date range, settings button
+2. **KPI Grid** — Dynamic cards generated from API response
+3. **Charts Row** — 3-column: Top Revenue, Top Direct Exp, Top Indirect Exp (doughnut charts)
+4. **YTD Trend** — Full-width bar chart (Revenue vs Expenses with GP/NP lines)
+5. **Analysis Overlay** — Opens on KPI/chart click, shows pie + table + breadcrumb navigation
+6. **Settings Modal** — Tally config, fiscal dates, company selection, module toggles, force resync
+7. **Sync Progress Bar** — Hidden until sync starts, polls every 1-2s
 
-The engine (`buildLedgerGroupMap` + `getGroupTree` + `computePLFlow`) builds everything in-memory — no SQL JOINs. Typical latency: **~25ms** for full KPI calculation on a year of data.
-
----
-
-## 8. Voucher Sync — 8 Types Extracted
-
-`Sales` · `Purchase` · `Receipt` · `Payment` · `Journal` · `Contra` · `Credit Note` · `Debit Note`
-
-Each sync does **8 Tally HTTP requests** (one per type) instead of 96 (12 months × 8).
-Each request returns ALL vouchers for Tally's current active period.
-Client-side `validRows` filters them into the correct month buckets.
-
----
-
-## 9. Critical Tally API Limitation (Must Know)
-
-> **Tally's Collection API ignores `SVFROMDATE`/`SVTODATE` completely.**
-
-When requesting voucher data, Tally always returns the vouchers for its **currently-active UI period** regardless of what date range is set in the request. This means:
-
-- **To sync FY 2024–25:** Open Tally → press **F2** → set period to `1-Apr-2024 / 31-Mar-2025` → then run sync.
-- **To sync FY 2025–26:** Set Tally period to `1-Apr-2025 / 31-Mar-2026` → sync.
-- This was confirmed via exhaustive testing of `$InRange`, `$$StrToDate`, XML entities, CDATA, and `##SVFromDate` — none of these filter Tally's Collection output.
-- `trial_balance`, `profit_loss`, `balance_sheet`, and `stock_summary` reports work correctly with date ranges (they use `TYPE=Data` reports, not `TYPE=Collection`).
+**Chart management:**
+- All charts stored in `charts = {}` object
+- `destroyChart(key)` helper prevents canvas reuse errors
+- Click handlers route to drill-down analysis
 
 ---
 
-## 10. Smart-Skip (Incremental Sync)
-
-Historical months (any month before the current calendar month) that already have data in the DB are **skipped automatically** on subsequent syncs. The check is:
+## 3. Database Schema Detail
 
 ```sql
-SELECT 1 FROM vouchers WHERE company_id=? AND date >= ? AND date <= ? LIMIT 1
+-- Core financial data
+trial_balance    UNIQUE(company_id, period_from, period_to, ledger_name)
+vouchers         UNIQUE INDEX(company_id, date, voucher_type, voucher_number, ledger_name, amount)
+
+-- Master data
+account_groups   (company_id, group_name, group_parent, bs_pl, dr_cr, affects_gross_profit)
+ledgers          (company_id, name, group_name)
+
+-- Reports
+stock_summary    (company_id, period_from, period_to, item_name, ...)
+bills_outstanding (company_id, date, bill_date, party_name, outstanding_amount, overdue_days)
+
+-- Optional modules
+gst_entries      (company_id, date, voucher_number, party_name, igst, cgst, sgst)
+cost_allocations (company_id, date, ledger_name, cost_centre, amount)
+payroll_entries   (company_id, date, employee_name, pay_head, amount)
+
+-- System
+app_settings     (key, value) — tally_host, tally_port, fiscal_from, fiscal_to, etc.
+sync_log         (company_id, module, status, records_count, errors)
+companies        (name, sync_modules JSON)
 ```
 
-Use `forceResync: true` in `POST /api/sync/start` to bypass and re-pull everything (e.g. after backdated corrections in Tally).
+**WAL mode** enabled for concurrent read/write performance.
 
 ---
 
-## 11. Completed Work — All Sessions
+## 4. P&L / KPI Formulas
 
-### Session 1 (9 Mar 2026)
-| Fix | What Was Done |
-|---|---|
-| FIX-1 | DB moved from C: (system drive) to `D:\Tally\TallyVision\data\` |
-| FIX-2 | 54,021 duplicate voucher rows removed; UNIQUE INDEX added; self-healing `runMigrations()` |
-| FIX-3 | `return` inside `db.transaction` for-loop silently dropped vouchers — changed to pre-filter `validRows[]` |
-| FIX-4 | Smart incremental sync — historical months already in DB are skipped |
-| FIX-5 | `forceResync` flag added to sync endpoint for manual full re-pull |
+```
+                                          Sign in DB
+Revenue (Sales Accounts)               =  credit (positive cr - dr)
+Direct Incomes                         =  credit
+Purchases                              =  debit  (negative, dr - cr)
+Direct Expenses                        =  debit
 
-### Session 2 (9 Mar 2026)
-| Fix | What Was Done |
-|---|---|
-| FIX-6 | `parseNumber()` lost negative sign on Tally's `(1234.56)` format — fixed |
-| FIX-7 | Same parentheses bug in `fetchVoucherCollection` inline `num()` — fixed |
-| FIX-8 | Added `AllInventoryEntries` NATIVEMETHOD to capture Sales/Purchase ledger from inventory vouchers |
-| FIX-9 | Bills Outstanding template completely rewritten — now uses nested `BillAllocations` walk for real bill-level data with correct `overdue_days` |
+Gross Profit  = Revenue + Direct Incomes + Purchases + Direct Expenses
+              = allDCFlow + allDDFlow
+              (allDD is already negative, so addition = subtraction)
 
-### Session 3 (9–11 Mar 2026)
-| Fix | What Was Done |
-|---|---|
-| FIX-10 | Dashboard freeze fixed — 30s Tally timeout blocked all HTTP; `loadCompanies()` decoupled from `checkStatus()`; timeout reduced to 5s |
-| FIX-11 | Voucher sync infinite re-sync loop fixed (NULL `sync_month` trap); progress bar frozen at 8% fixed |
-| FIX-12 | Reverted broken date-filter experiments (confirmed Tally Collection API ignores date ranges) |
-| FIX-13 | Fetch-once-per-type: 96 Tally requests → 8; phase 1 smart-skip + phase 2 distribute to month buckets |
-| FIX-14 | DataExtractor sync timeout raised from 60s → 300s (large XML responses from pharma companies) |
-| FIX-15 | Removed `AllInventoryEntries` NATIVEMETHOD — was causing 20–50MB XML responses (50+ stock lines per pharma invoice); `AllLedgerEntries` already contains all accounting entries including Sales/Purchase account |
+Indirect Incomes                       =  credit
+Indirect Expenses                      =  debit
+
+Net Profit    = Gross Profit + Indirect Incomes + Indirect Expenses
+              = GP + allICFlow + allIDFlow
+```
+
+**Group classification logic** (`buildPLGroupSets`):
+- Reads `account_groups` where `bs_pl = 'PL'`
+- `dr_cr = 'C'` + `affects_gross_profit = 'Y'` → directCredit
+- `dr_cr = 'D'` + `affects_gross_profit = 'Y'` → directDebit
+- `dr_cr = 'C'` + `affects_gross_profit = 'N'` → indirectCredit
+- `dr_cr = 'D'` + `affects_gross_profit = 'N'` → indirectDebit
+- Each set includes all recursive child groups via `getGroupTree()`
 
 ---
 
-## 12. Known Issues / Unresolved Items
+## 5. Critical Tally API Behaviors (Must Know)
+
+### 1. Collection API ignores date ranges
+`SVFROMDATE`/`SVTODATE` in `TYPE=Collection` requests are **completely ignored** by Tally. It always returns data for the currently-active UI period. Vouchers are post-filtered in JS by date.
+
+### 2. Purchase vouchers lack AllLedgerEntries
+When `AllLedgerEntries` is NOT in NATIVEMETHOD, Tally still auto-expands it for most voucher types (Sales: ~10.9 rows/voucher, Payment: ~2.1, Journal: ~2.0, Receipt: ~2.0) **BUT NOT for Purchase** (1.0 rows/voucher). Purchase vouchers return only the voucher-level Amount with PartyLedgerName.
+
+**Impact:** Voucher-based P&L calculations miss Purchase amounts because party names map to Sundry Creditors (BS group). Solution: Use TB data for anything Purchase-dependent (monthly trend, KPI top-up).
+
+### 3. SYSTEM Formulae can crash Tally
+`NOT $IsCancelled`, `NOT $IsOptional`, `$VoucherTypeName = "X"` filters in TDL cause "Bad formula!" crash for certain Tally companies. The bare Collection API approach (no filters at all) works universally.
+
+### 4. UTF-16LE encoding is mandatory
+Both request and response must use UTF-16LE. UTF-8 requests are silently ignored or return garbled data.
+
+### 5. Tally is single-threaded
+During large XML exports, Tally's HTTP server blocks. Status pings will timeout, showing a false "Tally Offline" state during sync.
+
+---
+
+## 6. Version History
+
+### v2.1.0 (FIX-23) — March 2026
+- Bare Collection API for vouchers (no SYSTEM Formulae, no AllLedgerEntries in NATIVEMETHOD)
+- 12 monthly requests per sync (all voucher types per request)
+- TB-based monthly trend (fixes understated Purchase/Direct Expenses)
+- GST/Payroll extractors: fetch-all-then-filter-in-JS pattern
+- Stock-item-ledger: removed broken filter definitions
+
+### v2.0.0 — March 2026
+- Dynamic TB engine (in-memory ledger-group maps, no SQL JOINs)
+- Redesigned dashboard with doughnut charts
+- GP/NP analysis with drill-down
+- buildPLGroupSets for automatic P&L classification
+- Monthly TB chunks (FIX-20)
+- Hybrid TB + voucher KPI computation (FIX-19)
+- Per-company optional module toggles
+- Force Resync UI
+
+### v1.0.0 — March 2026
+- Initial release
+- Basic extraction engine
+- Dashboard with bar/pie charts
+- Trial balance, ageing, stock summary views
+
+### Fix Log (v1.x)
+| Fix | Description |
+|-----|-------------|
+| FIX-1 | DB moved from C: to `D:\Tally\TallyVision\data\` |
+| FIX-2 | Duplicate voucher dedup + UNIQUE INDEX |
+| FIX-3 | `return` inside `db.transaction` loop dropping vouchers |
+| FIX-4 | Smart incremental sync (skip cached months) |
+| FIX-5 | `forceResync` flag |
+| FIX-6/7 | `parseNumber()` negative sign on `(1234.56)` format |
+| FIX-8 | Added AllInventoryEntries (later removed in FIX-15) |
+| FIX-9 | Bills Outstanding rewritten with BillAllocations WALK |
+| FIX-10 | Dashboard freeze (30s Tally timeout blocking HTTP) |
+| FIX-11 | Voucher sync infinite loop (NULL sync_month) |
+| FIX-12 | Reverted broken date-filter experiments |
+| FIX-13 | 96 Tally requests reduced to 8 (fetch-once-per-type) |
+| FIX-14 | Sync timeout raised to 300s |
+| FIX-15 | Removed AllInventoryEntries (20-50MB XML for pharma) |
+| FIX-16 | Custom group classification via account_groups metadata |
+| FIX-17 | Bills outstanding WALK=BillAllocations pattern |
+| FIX-18 | buildPLGroupSets for all custom P&L groups |
+| FIX-19 | Hybrid TB + voucher KPI computation |
+| FIX-20 | Monthly TB chunks with force resync |
+| FIX-23 | Bare Collection API, TB-based monthly trend |
+
+---
+
+## 7. Known Issues & Limitations
 
 | # | Issue | Severity | Notes |
-|---|---|---|---|
-| 1 | **"Tally Offline" badge during sync** | Low (cosmetic) | Tally's HTTP server is single-threaded — busy with sync XML generation, can't respond to status pings. Misleading but harmless. Fix: suppress offline badge when `syncInProgress = true`. |
-| 2 | **Sync requires manual Tally period change** | Medium | User must press F2 in Tally to set correct FY before syncing historical data. No in-app guidance. Fix: detect active Tally period via `##SVCurrentDate` and warn the user if it mismatches the sync range. |
-| 3 | **Zero voucher rows if Tally period is wrong** | High | If Tally's UI period doesn't match the requested FY, all vouchers pass through `validRows` filter, 0 rows are inserted, and no error is shown. Fix: after sync, check row count and show a warning if 0 vouchers were inserted for active months. |
-| 4 | **Bills Outstanding: no bill-level data in DB** | Medium | The improved FIX-9 template may not be returning correct data yet — needs verification after a successful sync. |
-| 5 | **No console logging for non-voucher sync steps** | Low | Only voucher extraction has `console.log`. Trial Balance, P&L, Balance Sheet, Stock steps are silent. Makes debugging difficult. |
-| 6 | **`license` table is a stub** | Low | Schema exists with `max_companies`, `valid_until` etc. but no enforcement logic. |
-| 7 | **No authentication on dashboard** | Medium | `dashboard_password` setting exists in DB but is never checked. Any local network user can access the dashboard if `lan_access=true`. |
-| 8 | **`auto_sync` setting is stored but not implemented** | Medium | `node-cron` is in package.json but no scheduled sync job exists in `server.js`. |
-| 9 | **Single company display only** | Medium | Dashboard shows one company at a time. Multi-company comparison not implemented. |
-| 10 | **AllInventoryEntries removed — may miss edge cases** | Low | In rare Tally configurations where Sales/Purchase ledger is ONLY in `AllInventoryEntries` and NOT in `AllLedgerEntries`, those entries will be missing. Needs verification post-sync with `SUM(amount) GROUP BY voucher_type`. |
+|---|-------|----------|-------|
+| 1 | "Tally Offline" badge during sync | Low | Tally's HTTP server is single-threaded, can't respond to pings during sync. Suppress badge when `syncInProgress = true`. |
+| 2 | Sync requires correct Tally period | Medium | User must press F2 in Tally to set correct FY. Add detection via `##SVCurrentDate`. |
+| 3 | No zero-voucher warning | High | If Tally period mismatches, 0 vouchers inserted with no error. Add post-sync validation. |
+| 4 | No dashboard authentication | Medium | `dashboard_password` setting exists but isn't enforced. Any LAN user can access. |
+| 5 | Auto-sync not implemented | Medium | `node-cron` in dependencies, `auto_sync` setting exists, but no scheduled job. |
+| 6 | License table is a stub | Low | Schema exists but no enforcement logic. |
+| 7 | Purchase vouchers lack ledger detail | Info | By design (Tally API limitation). TB data used as workaround. |
+| 8 | cost-allocations TDL untested | Low | Uses WALK=CostCentreDetails — field names may differ in some Tally versions. |
 
 ---
 
-## 13. What Needs to Be Built Next (Roadmap)
+## 8. Roadmap / What to Build Next
 
-### Priority 1 — Make V1 Reliable
-- [ ] **Post-sync validation alert:** If 0 vouchers inserted for active months, show a clear warning "Tally period mismatch — press F2 in Tally to set the correct FY and re-sync"
-- [ ] **Tally period indicator:** Show the active Tally period on the sync dialog (fetch it live from Tally before sync starts using `##SVCurrentDate`)
-- [ ] **Suppress "Tally Offline" during sync:** When `syncInProgress=true`, don't show the offline badge
-- [ ] **Verify Bills Outstanding data:** Run a sync and confirm bill-level rows with real `bill_date` and `overdue_days` are landing in `bills_outstanding` table
-- [ ] **Console logging for all sync steps:** Add `console.log` to TB, P&L, BS, Stock extract loops
+### Priority 1 — Reliability
+- [ ] Post-sync validation: warn if 0 vouchers inserted for active months
+- [ ] Detect Tally's active period before sync and warn on mismatch
+- [ ] Suppress "Tally Offline" badge during active sync
+- [ ] Console logging for all sync steps (currently only vouchers log)
 
 ### Priority 2 — Core Features
-- [ ] **Auto-sync scheduler:** Implement the `node-cron` job using the `auto_sync` and `sync_interval_minutes` settings already in DB. Should auto-sync daily (or on configurable interval) for the current FY.
-- [ ] **Multi-FY navigation:** Allow syncing and viewing multiple financial years, switchable from the dashboard date-range picker
-- [ ] **Export to Excel/PDF:** Dashboard KPIs and charts exportable as a report
-- [ ] **Dashboard password protection:** Implement `dashboard_password` check; basic login page
-- [ ] **LAN access toggle:** When `lan_access=true`, bind Express to `0.0.0.0` instead of `localhost`
+- [ ] Auto-sync scheduler using node-cron + existing `auto_sync` setting
+- [ ] Multi-FY navigation (sync and view multiple financial years)
+- [ ] Export dashboard to Excel/PDF
+- [ ] Dashboard password protection
+- [ ] LAN access toggle (bind to 0.0.0.0 when enabled)
 
-### Priority 3 — Product Features
-- [ ] **Multi-company support:** Sync and compare multiple Tally companies side by side
-- [ ] **Voucher drill-down:** Click on any KPI tile → see the underlying voucher list
-- [ ] **GST summary report:** GSTR-1 / GSTR-3B style breakdowns using voucher data
-- [ ] **Party-wise ledger statement:** Select any party → see all transactions in date range
-- [ ] **Budget vs Actual:** If budget data is maintained in Tally, pull and display variance
-- [ ] **License enforcement:** Implement `max_companies` and `valid_until` from the `license` table
-- [ ] **Installer / Setup wizard:** Currently relies on `install.bat` and manual steps; build a proper first-run wizard
+### Priority 3 — Analytics
+- [ ] YTD trend chart in analysis overlay (plan exists, implementation pending)
+- [ ] Interactive drill-down: click pie segment → show that item's monthly trend
+- [ ] Party-wise ledger statement (select party → see all transactions)
+- [ ] Budget vs Actual (if budget data exists in Tally)
+- [ ] Multi-company comparison dashboard
+- [ ] GST report (GSTR-1/3B style) from extracted data
 
 ### Priority 4 — Infrastructure
-- [ ] **Proper error boundaries in dashboard:** API failures currently show blank tiles with no message
-- [ ] **Sync history UI:** Show the `sync_log` table in a readable format on the dashboard
-- [ ] **DB backup utility:** One-click backup of `tallyvision.db` to a user-specified path
-- [ ] **Tally ERP 9 compatibility testing:** Currently assumed to work, untested
+- [ ] Error boundaries in dashboard (API failures show blank tiles)
+- [ ] Sync history UI (show sync_log in readable format)
+- [ ] DB backup utility (one-click backup)
+- [ ] Installer / setup wizard (replace install.bat)
+- [ ] Tally ERP 9 edge case testing
 
 ---
 
-## 14. Tally XML API Notes (For Future Development)
+## 9. Environment & Configuration
 
-### What works reliably
-- `TYPE=Data` with custom TDL reports (Trial Balance, P&L, Balance Sheet, Stock) — **respects date ranges**
-- `TYPE=Collection` with `TYPE=Voucher` + `AllLedgerEntries` NATIVEMETHOD — **ignores date ranges, returns current Tally period**
-- `TYPE=Collection` with `TYPE=Ledger` — works for Chart of Accounts and Ledger master
-- TCP ping on port 9000 for health check
-- utf-16le encoding for both request and response
-
-### What does NOT work
-- `SVFROMDATE`/`SVTODATE` in Collection exports — completely ignored by Tally
-- `$InRange:$Date:##SVFromDate:##SVToDate` — silently returns 0 vouchers
-- `$StrToDate` comparisons — returns 0
-- `##SVFromDate` in TDL formulae reflects Tally's UI period, not our request values
-- `AllInventoryEntries` NATIVEMETHOD — causes extremely large XML for inventory-heavy companies (pharma, etc.); safe to omit since `AllLedgerEntries` contains the same accounting data
-
-### Encoding
-```js
-const data = Buffer.from(xml, 'utf16le');   // request
-res.setEncoding('utf16le');                 // response
-```
-
----
-
-## 15. Environment & Configuration
-
-| Setting | Default | Where |
-|---|---|---|
+| Setting | Default | Location |
+|---------|---------|----------|
 | Tally host | `localhost` | `app_settings.tally_host` |
 | Tally port | `9000` | `app_settings.tally_port` |
 | Dashboard port | `3456` | `app_settings.dashboard_port` |
 | DB path | `D:\Tally\TallyVision\data\tallyvision.db` | `setup.js` or `TALLYVISION_DATA` env var |
-| Auto sync | `true` (stored, not enforced) | `app_settings.auto_sync` |
-| Sync interval | `60` minutes (stored, not enforced) | `app_settings.sync_interval_minutes` |
-| Theme | `dark` | `app_settings.theme` |
+| Auto sync | stored but not enforced | `app_settings.auto_sync` |
+| Sync interval | 60 min (stored, not enforced) | `app_settings.sync_interval_minutes` |
 | LAN access | `false` | `app_settings.lan_access` |
-| Password | `''` (empty = disabled) | `app_settings.dashboard_password` |
+| Password | empty (disabled) | `app_settings.dashboard_password` |
 
 ---
 
-## 16. Dependencies
+## 10. Dependencies
 
 | Package | Version | Purpose |
-|---|---|---|
+|---------|---------|---------|
 | `express` | ^4.21.0 | HTTP server + REST API |
 | `better-sqlite3` | ^11.0.0 | Synchronous SQLite (fast, no async overhead) |
 | `fast-xml-parser` | ^5.3.5 | Parse Tally's XML responses |
-| `cors` | ^2.8.5 | Allow browser fetch from same origin |
+| `cors` | ^2.8.5 | Cross-origin requests |
 | `node-cron` | ^3.0.3 | Scheduled sync (imported but not yet used) |
 | `uuid` | ^10.0.0 | Imported but not yet used |
 
-Frontend uses CDN links (no npm): **Chart.js**, **Tailwind CSS**, **Font Awesome**.
+**Frontend (CDN, no npm):** Chart.js v4, Tailwind CSS, Font Awesome
 
 ---
 
-*Document generated: March 2026 — covers all work from FIX-1 through FIX-15*
+## 11. Development Tips
+
+### Running locally
+```bash
+npm start                    # Start server on port 3456
+# OR
+node src/backend/server.js   # Same thing
+```
+
+### Testing extraction manually
+```bash
+npm run extract -- --company "Company Name" --from 2025-04-01 --to 2026-03-31
+```
+
+### Inspecting the database
+```bash
+# Use any SQLite viewer, or:
+node -e "const db = require('better-sqlite3')('data/tallyvision.db'); console.log(db.prepare('SELECT COUNT(*) as c FROM vouchers').get())"
+```
+
+### Adding a new API endpoint
+1. Add the route in `server.js` after existing similar endpoints
+2. Use `buildLedgerGroupMap()` and `buildPLGroupSets()` for any P&L computation
+3. Use `getTBSupplement()` for TB-based calculations
+4. Return JSON with `res.json()`
+
+### Adding a new extraction module
+1. Add the XML template in `xml-templates.js`
+2. Add the extraction method in `data-extractor.js`
+3. Add the DB table in `setup.js` (with migration if table doesn't exist)
+4. Call the new method from `runFullSync()` (conditionally, if it's an optional module)
+5. Add the API endpoint in `server.js`
+
+### Debugging Tally XML
+Set a breakpoint or `console.log` in `tally-connector.js` `sendXML()` to see raw XML request/response. Tally errors typically manifest as empty responses or XML with `<LINEERROR>` tags.
+
+---
+
+*Document generated: March 2026 — covers v1.0.0 through v2.1.0 (FIX-1 through FIX-23)*
