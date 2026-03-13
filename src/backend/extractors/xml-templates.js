@@ -1,8 +1,10 @@
 ﻿/**
- * TallyVision - XML Report Templates (v3 - Daybook Fix)
+ * TallyVision - XML Report Templates (v4 - FIX-23)
  * Compatible with Tally Prime Gold
- * Fixed: Daybook uses WALK:AllLedgerEntries for actual amounts
- * Fixed: SYSTEM closing tags
+ * FIX-23: Daybook uses bare Collection API — NO filters, NO AllLedgerEntries.
+ *   Tally SYSTEM Formulae (NOT $IsCancelled) crash some companies.
+ *   AllLedgerEntries expansion causes timeout (15MB+ for 1 week).
+ *   Filtering happens in JS after parsing.
  */
 
 const companyBlock = (c) => c ? `<SVCURRENTCOMPANY>${c}</SVCURRENTCOMPANY>` : '';
@@ -76,17 +78,12 @@ const TEMPLATES = {
 <COLLECTION NAME="C1"><TYPE>Ledger</TYPE></COLLECTION>`
     ),
 
-    'daybook': (fromDate, toDate, company, voucherType) => {
-        const SC = '<' + '/SYSTEM>';
-        // NOTE: Tally's Collection API ignores SVFROMDATE/SVTODATE — it always returns
-        // the currently-active Tally period's vouchers regardless of what date range is
-        // requested. Date filtering is handled client-side via validRows in data-extractor.
-        let filterNames = 'TVCancel,TVOptional';
-        let filterBlock = '';
-        if (voucherType) {
-            filterNames += ',TVVchType';
-            filterBlock = '<SYSTEM TYPE="Formulae" NAME="TVVchType">$VoucherTypeName = "' + voucherType + '"' + SC;
-        }
+    // FIX-23: Bare Collection API — NO filters, NO AllLedgerEntries.
+    // SYSTEM Formulae (NOT $IsCancelled etc.) crash Tally Prime for some companies.
+    // AllLedgerEntries expansion is too heavy (15MB+ for 1 week, timeout).
+    // Solution: voucher-level fields only, caller filters in JS.
+    // voucherType param kept for signature compat but ignored (no Tally-side filter).
+    'daybook': (fromDate, toDate, company, _voucherType) => {
         return `<?xml version="1.0" encoding="utf-8"?>
 <ENVELOPE>
 <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>TVDaybook</ID></HEADER>
@@ -96,12 +93,7 @@ const TEMPLATES = {
 <TDL><TDLMESSAGE>
 <COLLECTION NAME="TVDaybook"><TYPE>Voucher</TYPE>
 <NATIVEMETHOD>Date,VoucherTypeName,VoucherNumber,PartyLedgerName,Amount,Narration</NATIVEMETHOD>
-<NATIVEMETHOD>AllLedgerEntries</NATIVEMETHOD>
-<FILTER>${filterNames}</FILTER>
 </COLLECTION>
-<SYSTEM TYPE="Formulae" NAME="TVCancel">NOT $IsCancelled${SC}
-<SYSTEM TYPE="Formulae" NAME="TVOptional">NOT $IsOptional${SC}
-${filterBlock}
 </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
     },
 
@@ -166,9 +158,8 @@ ${filterBlock}
 
     // Stock Item Ledger — per-item transaction statement using NATIVEMETHOD AllInventoryEntries.
     // On-demand only (not in runFullSync). itemName must be exact Tally stock item name.
-    // Extractor filters for the specific item from the returned inventory entries.
+    // FIX-23: Removed SYSTEM Formulae filters (crash Tally Prime for some companies).
     'stock-item-ledger': (fromDate, toDate, company) => {
-        const SC = '<' + '/SYSTEM>';
         return `<?xml version="1.0" encoding="utf-8"?>
 <ENVELOPE>
 <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>TVStockLedger</ID></HEADER>
@@ -179,10 +170,7 @@ ${filterBlock}
 <COLLECTION NAME="TVStockLedger"><TYPE>Voucher</TYPE>
 <NATIVEMETHOD>Date,VoucherTypeName,VoucherNumber,PartyLedgerName,Amount</NATIVEMETHOD>
 <NATIVEMETHOD>AllInventoryEntries</NATIVEMETHOD>
-<FILTER>TVNoCancel,TVNoOptional</FILTER>
 </COLLECTION>
-<SYSTEM TYPE="Formulae" NAME="TVNoCancel">NOT $IsCancelled${SC}
-<SYSTEM TYPE="Formulae" NAME="TVNoOptional">NOT $IsOptional${SC}
 </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
     },
 

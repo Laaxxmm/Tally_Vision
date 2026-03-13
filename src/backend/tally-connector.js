@@ -11,7 +11,7 @@ class TallyConnector {
     constructor(config = {}) {
         this.host = config.host || 'localhost';
         this.port = config.port || 9000;
-        this.timeout = config.timeout || 5000;
+        this.timeout = config.timeout || 30000; // 30s default — large voucher requests need time
         this.tallyVersion = null; // 'prime' or 'erp9' - auto-detected
         this.currentCompany = null;
         this.xmlParser = new XMLParser({

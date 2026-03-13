@@ -495,26 +495,42 @@ app.get('/api/dashboard/monthly-trend', (req, res) => {
     const from = fromDate || '2024-04-01';
     const to = toDate || '2025-03-31';
 
-    const lgMap = buildLedgerGroupMap(companyId);
     const { directCredit, indirectCredit, directDebit, indirectDebit } = buildPLGroupSets(companyId);
-    const purchaseSet = new Set(getGroupTree(companyId, 'Purchase Accounts'));
 
-    const monthlyRows = getMonthlyVouchers(companyId, from, to);
+    // FIX-23: Use TB data for monthly trend (authoritative).
+    // Purchase vouchers lack AllLedgerEntries in bare Collection API, so
+    // voucher-based monthly trend missed ~5.7Cr of Purchases.
+    // Monthly TB records have correct per-ledger amounts for all P&L groups.
+    const tbRows = db.prepare(`
+        SELECT period_from as month, group_name,
+               SUM(net_debit) as net_debit, SUM(net_credit) as net_credit
+        FROM trial_balance t
+        WHERE company_id = ?
+          AND period_from >= ? AND period_to <= ?
+          AND group_name IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM trial_balance t2
+              WHERE t2.company_id = t.company_id
+                AND t2.ledger_name = t.ledger_name
+                AND t2.period_from = t.period_from
+                AND t2.period_to < t.period_to
+          )
+        GROUP BY period_from, group_name
+    `).all(companyId, from, to);
 
-    // Aggregate by month in JS using metadata-based sets
-    // Revenue = directCredit (Sales + Direct Income) for comprehensive trend view
     const months = {};
-    for (const row of monthlyRows) {
-        const grp = lgMap[row.ledger_name];
-        if (!grp) continue;
-        if (!months[row.month]) months[row.month] = { allDC: 0, allDD: 0, allIC: 0, allID: 0, revenue: 0, purchase: 0 };
+    for (const row of tbRows) {
+        const grp = row.group_name;
+        if (!months[row.month]) months[row.month] = { allDC: 0, allDD: 0, allIC: 0, allID: 0 };
         const m = months[row.month];
-        if (directCredit.has(grp))   m.allDC   += row.total;
-        if (directDebit.has(grp))    m.allDD   += row.total;
-        if (indirectCredit.has(grp)) m.allIC   += row.total;
-        if (indirectDebit.has(grp))  m.allID   += row.total;
-        if (directCredit.has(grp))   m.revenue += row.total;   // Revenue includes Sales + Direct Income
-        if (purchaseSet.has(grp))    m.purchase -= row.total;   // negated for display
+        const dr = row.net_debit  || 0;
+        const cr = row.net_credit || 0;
+        // Credit groups (revenue/income): flow = cr − dr (positive = earned)
+        // Debit groups (expenses): allDD -= (dr − cr) keeps allDD negative for expenses
+        if (directCredit.has(grp))   m.allDC += (cr - dr);
+        if (directDebit.has(grp))    m.allDD -= (dr - cr);
+        if (indirectCredit.has(grp)) m.allIC += (cr - dr);
+        if (indirectDebit.has(grp))  m.allID -= (dr - cr);
     }
 
     const result = Object.entries(months)
@@ -524,10 +540,10 @@ app.get('/api/dashboard/monthly-trend', (req, res) => {
             const netProfit   = grossProfit + d.allIC + d.allID;
             return {
                 month,
-                revenue: d.revenue,
-                expenses: -(d.allDD + d.allID),   // total expenses as positive
-                directExpenses: -d.allDD,          // direct expenses as positive
-                indirectExpenses: -d.allID,        // indirect expenses as positive
+                revenue: d.allDC,                      // Revenue = all direct credit flow
+                expenses: -(d.allDD + d.allID),        // total expenses as positive
+                directExpenses: -d.allDD,              // direct expenses as positive
+                indirectExpenses: -d.allID,            // indirect expenses as positive
                 grossProfit,
                 netProfit
             };

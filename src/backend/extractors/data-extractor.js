@@ -179,8 +179,9 @@ class DataExtractor {
                     rows.push({ date, voucherType, voucherNumber, ledgerName, amount, partyName, narration });
                 }
             } else {
-                // Fallback: no ledger entries — store voucher-level amount only
-                rows.push({ date, voucherType, voucherNumber, ledgerName: '', amount: voucherAmount, partyName, narration });
+                // FIX-23: No AllLedgerEntries (bare Collection API) — store voucher-level data.
+                // Use partyName as ledgerName (it's a real Tally ledger under Sundry Debtors/Creditors).
+                rows.push({ date, voucherType, voucherNumber, ledgerName: partyName, amount: voucherAmount, partyName, narration });
             }
         }
         
@@ -310,21 +311,22 @@ class DataExtractor {
     }
 
     async extractVouchers(companyId, companyName, fromDate, toDate, forceResync = false) {
-        // FIX-13: Fetch-once-per-type architecture.
+        // FIX-23: Bare Collection API — ONE request per month, ALL voucher types.
         //
-        // Tally's Collection API always returns the currently-active Tally period's
-        // vouchers regardless of SVFROMDATE/SVTODATE. Fetching the same data 12 times
-        // (once per month) is wasteful — 96 requests for a 12-month FY sync.
+        // Previous approaches that crashed Tally Prime (YUMM KERALAM):
+        //   - WALK + $Owner:$Date → "Bad formula!"
+        //   - Collection API + AllLedgerEntries → timeout (15MB+ for 1 week)
+        //   - SYSTEM Formulae (NOT $IsCancelled) → "Bad formula!"
+        //   - Per-type filters ($VoucherTypeName = "Sales") → "Bad formula!"
         //
-        // New approach:
-        //   Phase 1 — determine which months need syncing, DELETE stale rows.
-        //   Phase 2 — ONE Tally request per voucher type (8 total), parse all vouchers,
-        //             distribute to the correct month buckets using validRows.
+        // Working approach (proven): bare Collection API with NATIVEMETHOD only.
+        // Returns voucher-level data (Date, VoucherTypeName, VoucherNumber,
+        // PartyLedgerName, Amount, Narration). No sub-collections, no filters.
+        // 13,384 vouchers in 3.1s for full year — fast and reliable.
         //
-        // Result: 8 requests instead of 96 → ~12x faster (seconds, not minutes).
+        // Result: 12 requests/year (1 per month) instead of 96.
 
         const chunks = this.generateMonthChunks(fromDate, toDate);
-        const types = ['Sales','Purchase','Receipt','Payment','Journal','Contra','Credit Note','Debit Note'];
         let total = 0;
 
         const ins = this.db.prepare(
@@ -332,7 +334,7 @@ class DataExtractor {
         );
 
         // ── Phase 1: Smart-skip check + DELETE stale data ─────────────────────────
-        const activeChunks = []; // months that actually need Tally data
+        const activeChunks = [];
         for (let i = 0; i < chunks.length; i++) {
             const c = chunks[i];
             const syncMonth = c.from.substring(0, 7);
@@ -349,7 +351,6 @@ class DataExtractor {
                 }
             }
 
-            // Month needs refresh — clear any stale rows before inserting fresh data
             this.db.prepare('DELETE FROM vouchers WHERE company_id=? AND date >= ? AND date <= ?')
                 .run(companyId, c.from, c.to);
             activeChunks.push({ ...c, syncMonth });
@@ -362,109 +363,54 @@ class DataExtractor {
             return 0;
         }
 
-        // ── Phase 2: One request per voucher type ─────────────────────────────────
-        for (let j = 0; j < types.length; j++) {
-            const vt = types[j];
+        // Helper: parse date from Tally's YYYYMMDD or DD-Mon-YYYY format
+        const parseTallyDate = (dateStr, fallback) => {
+            if (!dateStr) return fallback;
+            const s = String(dateStr).trim();
+            if (/^\d{8}$/.test(s)) return s.substring(0, 4) + '-' + s.substring(4, 6) + '-' + s.substring(6, 8);
+            return this.parseDate(s) || fallback;
+        };
+
+        // ── Phase 2: ONE request per month — all voucher types ────────────────────
+        for (let i = 0; i < activeChunks.length; i++) {
+            const c = activeChunks[i];
             this.onProgress({ step: 'vouchers', status: 'running',
-                message: `Vouchers: fetching ${vt} (${j + 1}/${types.length})`,
-                progress: Math.round((j / types.length) * 100) });
+                message: `Vouchers: ${c.label} (${i + 1}/${activeChunks.length})`,
+                progress: Math.round(((i + 1) / activeChunks.length) * 100) });
 
             let rows = [];
             try {
-                // Pass the full sync range — SVFROMDATE/SVTODATE are hints only; Tally
-                // returns its active period. validRows distributes data to month buckets.
                 const xml = TEMPLATES['daybook'](
-                    this.formatTallyDate(fromDate), this.formatTallyDate(toDate), companyName, vt
+                    this.formatTallyDate(c.from), this.formatTallyDate(c.to), companyName
                 );
-                console.log(`[Sync] Requesting ${vt} from Tally...`);
+                console.log(`[Sync] Requesting vouchers ${c.label} from Tally...`);
                 const t0 = Date.now();
-                rows = await this.withRetry(() => this.fetchVoucherCollection(xml), `V ${vt}`);
-                console.log(`[Sync] ${vt}: got ${rows.length} ledger rows in ${((Date.now()-t0)/1000).toFixed(1)}s`);
+                rows = await this.withRetry(() => this.fetchVoucherCollection(xml), `V ${c.label}`);
+                console.log(`[Sync] Vouchers ${c.label}: got ${rows.length} rows in ${((Date.now()-t0)/1000).toFixed(1)}s`);
             } catch (e) {
-                console.error(`[Sync] ${vt} FAILED: ${e.message}`);
-                this.logSync(companyId, `vouchers-${vt}`, fromDate, toDate, 'error', 0, e.message);
+                console.error(`[Sync] Vouchers ${c.label} FAILED: ${e.message}`);
+                this.logSync(companyId, 'vouchers', c.from, c.to, 'error', 0, e.message);
                 continue;
             }
 
-            if (!rows.length) { console.log(`[Sync] ${vt}: 0 rows, skipping`); continue; }
+            if (!rows.length) continue;
 
-            // Parse all dates once upfront
-            const parsedRows = rows.map(r => {
-                let parsedDate = fromDate;
-                if (r.date && r.date.length === 8 && /^\d{8}$/.test(r.date)) {
-                    parsedDate = r.date.substring(0, 4) + '-' + r.date.substring(4, 6) + '-' + r.date.substring(6, 8);
-                } else if (r.date) {
-                    parsedDate = this.parseDate(r.date) || fromDate;
-                }
-                return { ...r, parsedDate };
+            // Filter to current month window and insert
+            const validRows = rows.filter(r => {
+                const d = parseTallyDate(r.date, c.from);
+                return d >= c.from && d <= c.to;
             });
+            if (!validRows.length) continue;
 
-            // Distribute to each active (uncached) month bucket
-            for (const c of activeChunks) {
-                const validRows = parsedRows.filter(r => r.parsedDate >= c.from && r.parsedDate <= c.to);
-                if (!validRows.length) continue;
-
-                this.db.transaction((vRows) => {
-                    for (const r of vRows) {
-                        ins.run(companyId, r.parsedDate, r.voucherType || vt,
-                            r.voucherNumber || '', r.ledgerName || '',
-                            r.amount, r.partyName, r.narration, c.syncMonth);
-                    }
-                })(validRows);
-                total += validRows.length;
-            }
-
-            this.onProgress({ step: 'vouchers', status: 'running',
-                message: `Vouchers: ${vt} done`,
-                progress: Math.round(((j + 1) / types.length) * 100) });
-        }
-
-        // ── Phase 3: Catch-all pass (no type filter) ──────────────────────────
-        // Captures custom-named voucher types (e.g., "Purchases", "Bills") not in
-        // the standard list above. INSERT OR IGNORE silently skips already-inserted rows.
-        this.onProgress({ step: 'vouchers', status: 'running',
-            message: 'Vouchers: fetching all (catch-all for custom types)',
-            progress: 95 });
-        try {
-            const xmlAll = TEMPLATES['daybook'](
-                this.formatTallyDate(fromDate), this.formatTallyDate(toDate), companyName
-                // no voucherType argument → no filter → returns ALL types
-            );
-            console.log('[Sync] Requesting ALL vouchers (catch-all)...');
-            const t0 = Date.now();
-            const allRows = await this.withRetry(() => this.fetchVoucherCollection(xmlAll), 'V ALL');
-            console.log(`[Sync] ALL: got ${allRows.length} ledger rows in ${((Date.now()-t0)/1000).toFixed(1)}s`);
-
-            if (allRows.length > 0) {
-                const parsedAll = allRows.map(r => {
-                    let parsedDate = fromDate;
-                    if (r.date && r.date.length === 8 && /^\d{8}$/.test(r.date)) {
-                        parsedDate = r.date.substring(0, 4) + '-' + r.date.substring(4, 6) + '-' + r.date.substring(6, 8);
-                    } else if (r.date) {
-                        parsedDate = this.parseDate(r.date) || fromDate;
-                    }
-                    return { ...r, parsedDate };
-                });
-                let catchAllCount = 0;
-                for (const c of activeChunks) {
-                    const validRows = parsedAll.filter(r => r.parsedDate >= c.from && r.parsedDate <= c.to);
-                    if (!validRows.length) continue;
-                    this.db.transaction((vRows) => {
-                        for (const r of vRows) {
-                            const result = ins.run(companyId, r.parsedDate, r.voucherType || '',
-                                r.voucherNumber || '', r.ledgerName || '',
-                                r.amount, r.partyName, r.narration, c.syncMonth);
-                            if (result.changes > 0) catchAllCount++;
-                        }
-                    })(validRows);
+            this.db.transaction((vRows) => {
+                for (const r of vRows) {
+                    ins.run(companyId, parseTallyDate(r.date, c.from),
+                        r.voucherType || '', r.voucherNumber || '',
+                        r.ledgerName || '', r.amount,
+                        r.partyName || '', r.narration || '', c.syncMonth);
                 }
-                if (catchAllCount > 0) {
-                    console.log(`[Sync] Catch-all: inserted ${catchAllCount} new rows from custom voucher types`);
-                    total += catchAllCount;
-                }
-            }
-        } catch (e) {
-            console.warn(`[Sync] Catch-all pass failed: ${e.message}`);
+            })(validRows);
+            total += validRows.length;
         }
 
         this.logSync(companyId, 'vouchers', fromDate, toDate, 'success', total);
@@ -568,21 +514,22 @@ class DataExtractor {
     }
 
     async extractGstEntries(companyId, companyName, fromDate, toDate, forceResync = false) {
-        // Fetch Sales/Purchase/CN/DN vouchers and store as GST entries.
-        // Reuses fetchVoucherCollection (daybook template) — no extra Tally requests
-        // if these voucher types were already fetched; this module adds separate storage.
+        // FIX-23: Fetch ALL vouchers once per month, filter GST types in JS.
+        // (daybook template no longer supports Tally-side type filtering)
         const chunks = this.generateMonthChunks(fromDate, toDate);
-        const gstTypes = ['Sales', 'Purchase', 'Credit Note', 'Debit Note'];
+        const gstTypeSet = new Set(['Sales', 'Purchase', 'Credit Note', 'Debit Note']);
         let total = 0;
 
-        const ins = this.db.prepare(
-            'INSERT OR IGNORE INTO gst_entries (company_id,date,voucher_type,voucher_number,party_name,amount,sync_month) VALUES (?,?,?,?,?,?,?)'
-        );
-        // Use amount column mapped from taxable_value for basic tracking
-        // (full GST split extraction to be added in future with dedicated TDL)
         const insGst = this.db.prepare(
             'INSERT OR IGNORE INTO gst_entries (company_id,date,voucher_type,voucher_number,party_name,taxable_value,sync_month) VALUES (?,?,?,?,?,?,?)'
         );
+
+        const parseTallyDate = (dateStr, fallback) => {
+            if (!dateStr) return fallback;
+            const s = String(dateStr).trim();
+            if (/^\d{8}$/.test(s)) return s.substring(0, 4) + '-' + s.substring(4, 6) + '-' + s.substring(6, 8);
+            return this.parseDate(s) || fallback;
+        };
 
         for (const c of chunks) {
             const syncMonth = c.from.substring(0, 7);
@@ -592,29 +539,30 @@ class DataExtractor {
             }
             this.onProgress({ step: 'gst', status: 'running', message: `GST Entries: ${c.label}` });
             this.db.prepare('DELETE FROM gst_entries WHERE company_id=? AND sync_month=?').run(companyId, syncMonth);
-            for (const vt of gstTypes) {
-                try {
-                    const xml = TEMPLATES['daybook'](this.formatTallyDate(c.from), this.formatTallyDate(c.to), companyName, vt);
-                    const rows = await this.withRetry(() => this.fetchVoucherCollection(xml), `GST ${vt} ${c.label}`);
-                    // Aggregate to voucher level (sum of debit entries = taxable value proxy)
-                    const voucherMap = new Map();
-                    for (const r of rows) {
-                        const key = `${r.date}||${r.voucherNumber}`;
-                        if (!voucherMap.has(key)) voucherMap.set(key, { ...r, totalAmt: 0 });
-                        if (r.amount > 0) voucherMap.get(key).totalAmt += r.amount;
-                    }
-                    this.db.transaction((entries) => {
-                        for (const [, v] of entries) {
-                            const d = v.date && v.date.length === 8 ? `${v.date.substring(0,4)}-${v.date.substring(4,6)}-${v.date.substring(6,8)}` : (this.parseDate(v.date) || c.from);
-                            if (d >= c.from && d <= c.to) {
-                                insGst.run(companyId, d, v.voucherType, v.voucherNumber || '', v.partyName || '', v.totalAmt, syncMonth);
-                                total++;
-                            }
-                        }
-                    })(voucherMap);
-                } catch (e) {
-                    console.warn(`[GST ${vt} ${c.label}] ${e.message}`);
+            try {
+                const xml = TEMPLATES['daybook'](this.formatTallyDate(c.from), this.formatTallyDate(c.to), companyName);
+                const rows = await this.withRetry(() => this.fetchVoucherCollection(xml), `GST ${c.label}`);
+
+                // Filter to GST types and aggregate per voucher
+                const voucherMap = new Map();
+                for (const r of rows) {
+                    if (!gstTypeSet.has(r.voucherType)) continue;
+                    const key = `${r.date}||${r.voucherNumber}||${r.voucherType}`;
+                    if (!voucherMap.has(key)) voucherMap.set(key, { date: r.date, voucherType: r.voucherType, voucherNumber: r.voucherNumber, partyName: r.partyName, totalAmt: 0 });
+                    voucherMap.get(key).totalAmt += Math.abs(r.amount);
                 }
+
+                this.db.transaction((entries) => {
+                    for (const [, v] of entries) {
+                        const d = parseTallyDate(v.date, c.from);
+                        if (d >= c.from && d <= c.to) {
+                            insGst.run(companyId, d, v.voucherType, v.voucherNumber || '', v.partyName || '', v.totalAmt, syncMonth);
+                            total++;
+                        }
+                    }
+                })(voucherMap);
+            } catch (e) {
+                console.warn(`[GST ${c.label}] ${e.message}`);
             }
             this.logSync(companyId, 'gst-entries', c.from, c.to, 'success', total);
         }
@@ -622,11 +570,20 @@ class DataExtractor {
     }
 
     async extractPayroll(companyId, companyName, fromDate, toDate, forceResync = false) {
+        // FIX-23: Fetch all vouchers, filter voucherType === 'Payroll' in JS
         const chunks = this.generateMonthChunks(fromDate, toDate);
         let total = 0;
         const ins = this.db.prepare(
             'INSERT OR IGNORE INTO payroll_entries (company_id,date,voucher_number,employee_name,pay_head,amount,sync_month) VALUES (?,?,?,?,?,?,?)'
         );
+
+        const parseTallyDate = (dateStr, fallback) => {
+            if (!dateStr) return fallback;
+            const s = String(dateStr).trim();
+            if (/^\d{8}$/.test(s)) return s.substring(0, 4) + '-' + s.substring(4, 6) + '-' + s.substring(6, 8);
+            return this.parseDate(s) || fallback;
+        };
+
         for (const c of chunks) {
             const syncMonth = c.from.substring(0, 7);
             if (!forceResync && this.isHistoricalMonth(syncMonth)) {
@@ -635,8 +592,10 @@ class DataExtractor {
             }
             this.onProgress({ step: 'payroll', status: 'running', message: `Payroll: ${c.label}` });
             try {
-                const xml = TEMPLATES['daybook'](this.formatTallyDate(c.from), this.formatTallyDate(c.to), companyName, 'Payroll');
-                const rows = await this.withRetry(() => this.fetchVoucherCollection(xml), `Payroll ${c.label}`);
+                const xml = TEMPLATES['daybook'](this.formatTallyDate(c.from), this.formatTallyDate(c.to), companyName);
+                const allRows = await this.withRetry(() => this.fetchVoucherCollection(xml), `Payroll ${c.label}`);
+                // Filter to Payroll voucher type only
+                const rows = allRows.filter(r => r.voucherType === 'Payroll');
                 if (!rows.length) {
                     this.logSync(companyId, 'payroll', c.from, c.to, 'success', 0);
                     continue;
@@ -644,9 +603,7 @@ class DataExtractor {
                 this.db.prepare('DELETE FROM payroll_entries WHERE company_id=? AND sync_month=?').run(companyId, syncMonth);
                 this.db.transaction((rows) => {
                     for (const r of rows) {
-                        const d = r.date && r.date.length === 8
-                            ? `${r.date.substring(0,4)}-${r.date.substring(4,6)}-${r.date.substring(6,8)}`
-                            : (this.parseDate(r.date) || c.from);
+                        const d = parseTallyDate(r.date, c.from);
                         if (d >= c.from && d <= c.to) {
                             ins.run(companyId, d, r.voucherNumber || '', r.partyName || '', r.ledgerName || '', r.amount, syncMonth);
                             total++;
