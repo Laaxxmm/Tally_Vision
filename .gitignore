@@ -14,9 +14,11 @@ _*.json
 check*.js
 debug.js
 query-db*.js
-test-db.js
+test-*.js
 db-*.txt
+db-*.log
 dash-raw.txt
+CHANGES.md
 
 # npm logs
 npm-*.log
